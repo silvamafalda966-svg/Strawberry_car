@@ -1,0 +1,49 @@
+# STM32CubeMX / MDK-ARM generated files
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvoptx
+MDK-ARM/*.scvd
+MDK-ARM/DebugConfig/
+MDK-ARM/Listings/
+MDK-ARM/Objects/
+MDK-ARM/RTE/
+MDK-ARM/*.admin
+MDK-ARM/*.crf
+MDK-ARM/*.d
+MDK-ARM/*.o
+MDK-ARM/*.axf
+MDK-ARM/*.hex
+MDK-ARM/*.htm
+MDK-ARM/*.lnp
+MDK-ARM/*.lst
+MDK-ARM/*.map
+MDK-ARM/*.iex
+MDK-ARM/*.sct
+MDK-ARM/*.dep
+MDK-ARM/*.build_log.htm
+MDK-ARM/*.tra
+MDK-ARM/*.uvprojx.bak
+
+# STM32CubeMX backup files
+*.ioc.bak
+*.ioc.orig
+
+# Binary and temporary files
+*.bin
+*.elf
+*.out
+*.o
+*.d
+*.crf
+*.lnp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
