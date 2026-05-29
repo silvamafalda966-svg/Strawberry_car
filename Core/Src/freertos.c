@@ -203,17 +203,21 @@ void StartTaskChassis(void const * argument)
       __HAL_TIM_SET_COUNTER(&htim8, 0);
       speed_BR_mps = (float)dBR * 0.0003694f;
 
-      // ── C. 视觉队列检查（非阻塞） ──
+      // ── C. 视觉队列检查（仅需 K210 的状态才取队列） ──
       VisionData_t vis_frame;
       uint8_t has_vision = 0;
-      osEvent evt = osMessageGet(Queue_VisionDataHandle, 0);
-      if (evt.status == osEventMessage) {
-          uint32_t raw = evt.value.v;
-          vis_frame.class_id = (raw >> 0)  & 0xFF;
-          vis_frame.x        = (raw >> 8)  & 0xFF;
-          vis_frame.y        = (raw >> 16) & 0xFF;
-          vis_frame.area     = (raw >> 24) & 0xFF;
-          has_vision = 1;
+      if (g_chassis_state == STATE_LINE_FOLLOW ||
+          g_chassis_state == STATE_BREAKAWAY ||
+          g_chassis_state == STATE_VISUAL_APPROACH) {
+          osEvent evt = osMessageGet(Queue_VisionDataHandle, 0);
+          if (evt.status == osEventMessage) {
+              uint32_t raw = evt.value.v;
+              vis_frame.class_id = (raw >> 0)  & 0xFF;
+              vis_frame.x        = (raw >> 8)  & 0xFF;
+              vis_frame.y        = (raw >> 16) & 0xFF;
+              vis_frame.area     = (raw >> 24) & 0xFF;
+              has_vision = 1;
+          }
       }
 
       // ── D. 传感器数据获取（互斥锁） ──

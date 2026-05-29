@@ -1,5 +1,6 @@
 #include "chassis.h"
 #include "pid.h"
+#include "cmsis_os.h"
 #include <stdlib.h>   // atof
 #include <string.h>   // memset
 
@@ -142,8 +143,14 @@ static void entry_debug(void)           { /* 保持当前 PID 状态，不操作
 
 static void entry_idle(void)            { Chassis_Stop(); }
 
-// ═══ Phase 1 STUB entries — 全部安全停住，Phase 2~4 逐步替换 ═══
-static void entry_line_follow(void)     { Chassis_Stop(); } // TODO Phase 2: MoveForward(0.3)
+static void entry_line_follow(void) {
+    Chassis_MoveForward(0.3f);
+    // 排空 K210 队列，扔掉避障/倒车期间囤的旧帧
+    extern osMessageQId Queue_VisionDataHandle;
+    while (osMessageGet(Queue_VisionDataHandle, 0).status == osEventMessage) {}
+}
+
+// ═══ Phase 1 STUB entries — 其余安全停住，Phase 2~4 逐步替换 ═══
 static void entry_obstacle(void)        { Chassis_Stop(); }
 static void entry_green_filter(void)    { Chassis_Stop(); }
 static void entry_breakaway(void)       { Chassis_Stop(); }
