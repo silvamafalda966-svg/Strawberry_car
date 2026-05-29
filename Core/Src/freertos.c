@@ -26,8 +26,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "pid.h"
-#include "bsp_motor.h" // 假设你的底层电机控制和测速在这个文件里
-#include "tim.h"  // 必须包含这个，才能让 freertos.c 认识 htim5, htim2 等
+#include "bsp_motor.h"
+#include "chassis.h"
+#include "tim.h"
 #include <string.h>
 #include <stdlib.h>
 /* USER CODE END Includes */
@@ -49,20 +50,17 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-uint8_t rx_buf[32];          // 接收缓存
-uint8_t rx_index = 0;        // 缓存索引
-volatile uint8_t rx_flag = 0;// 指令到达标志
-uint8_t rx_byte;             // 单字节接收位
+uint8_t rx_buf[32];
+uint8_t rx_index = 0;
+volatile uint8_t rx_flag = 0;
+uint8_t rx_byte;
 // K210 8字节帧解析状态机
-uint8_t  k210_buf[8];        // K210 帧缓存
-uint8_t  k210_idx = 0;       // 当前接收索引
-uint8_t  k210_sync = 0;      // 0=找0xAA头, 1=收帧中
-volatile uint8_t k210_ready = 0; // 完整帧到达标志
-// 为四个轮子单独分配 PID 大脑，并直接赋初始值（防死锁）
-extern PID_TypeDef pid_FL;
-extern PID_TypeDef pid_FR;
-extern PID_TypeDef pid_BL;
-extern PID_TypeDef pid_BR;
+uint8_t  k210_buf[8];
+uint8_t  k210_idx = 0;
+uint8_t  k210_sync = 0;
+volatile uint8_t k210_ready = 0;
+// 传感器数据（Task_Sensor 写，Task_PID_Ctrl 读）
+static SensorData_t g_sensor_data = {{0}, 300.0f};
 /* USER CODE END Variables */
 osThreadId Task_PID_CtrlHandle;
 osThreadId Task_VisionHandle;
@@ -127,7 +125,7 @@ void MX_FREERTOS_Init(void) {
 
   /* Create the queue(s) */
   /* definition and creation of Queue_VisionData */
-  osMessageQDef(Queue_VisionData, 2, 12);
+  osMessageQDef(Queue_VisionData, 2, sizeof(uint32_t));
   Queue_VisionDataHandle = osMessageCreate(osMessageQ(Queue_VisionData), NULL);
 
   /* USER CODE BEGIN RTOS_QUEUES */
@@ -167,53 +165,28 @@ void MX_FREERTOS_Init(void) {
 void StartTaskChassis(void const * argument)
 {
   /* USER CODE BEGIN StartTaskChassis */
-  // 1. 给四个轮子赋初始 PID 参数（防死锁）
-  pid_FL.direction = 1;  pid_FL.Kp = 0.35f; pid_FL.Ki = 0.06f; pid_FL.Kd = 0.04f; pid_FL.Target = 0.0f;
-  pid_BL.direction = 1;  pid_BL.Kp = 0.35f; pid_BL.Ki = 0.06f; pid_BL.Kd = 0.04f; pid_BL.Target = 0.0f;
-  pid_FR.direction = 1;  pid_FR.Kp = 0.35f; pid_FR.Ki = 0.06f; pid_FR.Kd = 0.04f; pid_FR.Target = 0.0f;
-  pid_BR.direction = 1;  pid_BR.Kp = 0.35f; pid_BR.Ki = 0.06f; pid_BR.Kd = 0.04f; pid_BR.Target = 0.0f;
+  // 1. 四轮初始 PID 参数（防死锁）
+  pid_FL.direction = 1; pid_FL.Kp = 0.35f; pid_FL.Ki = 0.06f; pid_FL.Kd = 0.04f; pid_FL.Target = 0.0f;
+  pid_BL.direction = 1; pid_BL.Kp = 0.35f; pid_BL.Ki = 0.06f; pid_BL.Kd = 0.04f; pid_BL.Target = 0.0f;
+  pid_FR.direction = 1; pid_FR.Kp = 0.35f; pid_FR.Ki = 0.06f; pid_FR.Kd = 0.04f; pid_FR.Target = 0.0f;
+  pid_BR.direction = 1; pid_BR.Kp = 0.35f; pid_BR.Ki = 0.06f; pid_BR.Kd = 0.04f; pid_BR.Target = 0.0f;
 
-  // 2. 确保 USART1 VOFA+ 中断开启
+  // 2. 启动 USART1 VOFA+ 中断
   extern UART_HandleTypeDef huart1;
   HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
-  static uint8_t cur_wheel = 4; // 当前选中轮: 0=FL,1=FR,2=BL,3=BR,4=ALL（默认全选）
+  // 3. 状态机初始化
+  Chassis_Init();
 
   for(;;)
   {
-      // A.【参数解析区】VOFA+ 命令
-      if (rx_flag == 1)
-      {
-          if (rx_buf[0] == 'W') {
-              cur_wheel = (rx_buf[1] == 'A') ? 4 : (rx_buf[1] - '0');
-              // 切换轮子时，清零非选中轮 Target
-              for (int i = 0; i < 4; i++) {
-                  PID_TypeDef *p = (i==0)?&pid_FL:(i==1)?&pid_FR:(i==2)?&pid_BL:&pid_BR;
-                  if (cur_wheel < 4 && i != (int)cur_wheel) p->Target = 0.0f;
-              }
-          } else {
-              float val = atof((char*)&rx_buf[1]);
-              if (cur_wheel < 4) {
-                  PID_TypeDef *pid = (cur_wheel==0)?&pid_FL:(cur_wheel==1)?&pid_FR:(cur_wheel==2)?&pid_BL:&pid_BR;
-                  switch (rx_buf[0]) {
-                      case 'P': pid->Kp = val; break;
-                      case 'I': pid->Ki = val; break;
-                      case 'D': pid->Kd = val; break;
-                      case 'T': pid->Target = val; break;
-                  }
-              } else {
-                  switch (rx_buf[0]) {
-                      case 'P': pid_FL.Kp = pid_FR.Kp = pid_BL.Kp = pid_BR.Kp = val; break;
-                      case 'I': pid_FL.Ki = pid_FR.Ki = pid_BL.Ki = pid_BR.Ki = val; break;
-                      case 'D': pid_FL.Kd = pid_FR.Kd = pid_BL.Kd = pid_BR.Kd = val; break;
-                      case 'T': pid_FL.Target = pid_FR.Target = pid_BL.Target = pid_BR.Target = val; break;
-                  }
-              }
-          }
+      // ── A. VOFA+ 命令解析 ──
+      if (rx_flag == 1) {
+          Chassis_VOFA_Parse(rx_buf);
           rx_flag = 0;
       }
 
-      // B.【编码器采集】四路独立读数
+      // ── B. 编码器采集（四路独立） ──
       short dFL = (short)__HAL_TIM_GET_COUNTER(&htim5);
       __HAL_TIM_SET_COUNTER(&htim5, 0);
       speed_FL_mps = (float)dFL * 0.0003694f;
@@ -230,18 +203,57 @@ void StartTaskChassis(void const * argument)
       __HAL_TIM_SET_COUNTER(&htim8, 0);
       speed_BR_mps = (float)dBR * 0.0003694f;
 
-      // C.【PID 计算 + 电机下发】只给选中轮子输出
-      float pwm_FL = (cur_wheel==0||cur_wheel==4) ? CalcOneWheel(&pid_FL, speed_FL_mps) : 0.0f;
-      float pwm_FR = (cur_wheel==1||cur_wheel==4) ? CalcOneWheel(&pid_FR, speed_FR_mps) : 0.0f;
-      float pwm_BL = (cur_wheel==2||cur_wheel==4) ? CalcOneWheel(&pid_BL, speed_BL_mps) : 0.0f;
-      float pwm_BR = (cur_wheel==3||cur_wheel==4) ? CalcOneWheel(&pid_BR, speed_BR_mps) : 0.0f;
+      // ── C. 视觉队列检查（非阻塞） ──
+      VisionData_t vis_frame;
+      uint8_t has_vision = 0;
+      osEvent evt = osMessageGet(Queue_VisionDataHandle, 0);
+      if (evt.status == osEventMessage) {
+          uint32_t raw = evt.value.v;
+          vis_frame.class_id = (raw >> 0)  & 0xFF;
+          vis_frame.x        = (raw >> 8)  & 0xFF;
+          vis_frame.y        = (raw >> 16) & 0xFF;
+          vis_frame.area     = (raw >> 24) & 0xFF;
+          has_vision = 1;
+      }
+
+      // ── D. 传感器数据获取（互斥锁） ──
+      SensorData_t local_sensor;
+      memset(&local_sensor, 0, sizeof(local_sensor));
+      local_sensor.distance_cm = 300.0f;
+      if (osMutexWait(Mutex_SensorDataHandle, 0) == osOK) {
+          local_sensor = g_sensor_data;
+          osMutexRelease(Mutex_SensorDataHandle);
+      }
+
+      // ── E. 紧急刹车检查 ──
+      if (g_emergency_stop) {
+          Chassis_Stop();
+          g_chassis_state = STATE_OBSTACLE;
+          if (speed_FL_mps < 0.03f && speed_FL_mps > -0.03f &&
+              speed_FR_mps < 0.03f && speed_FR_mps > -0.03f &&
+              speed_BL_mps < 0.03f && speed_BL_mps > -0.03f &&
+              speed_BR_mps < 0.03f && speed_BR_mps > -0.03f) {
+              g_emergency_stop = 0;
+          }
+      }
+
+      // ── F. 状态机运行 ──
+      Chassis_StateMachine_Run(&local_sensor, has_vision, &vis_frame,
+                               (int32_t)dFL, (int32_t)dFR,
+                               (int32_t)dBL, (int32_t)dBR);
+
+      // ── G. PID 计算 + 电机下发（四轮统一） ──
+      float pwm_FL = CalcOneWheel(&pid_FL, speed_FL_mps);
+      float pwm_FR = CalcOneWheel(&pid_FR, speed_FR_mps);
+      float pwm_BL = CalcOneWheel(&pid_BL, speed_BL_mps);
+      float pwm_BR = CalcOneWheel(&pid_BR, speed_BR_mps);
 
       Motor_FL_SetSpeed((int)pwm_FL);
       Motor_FR_SetSpeed((int)pwm_FR);
       Motor_BL_SetSpeed((int)pwm_BL);
       Motor_BR_SetSpeed((int)pwm_BR);
 
-      // D.【监控上传区】VOFA+ 四路速度波形
+      // ── H. VOFA+ 上传 ──
       float vofa_buf[5];
       vofa_buf[0] = speed_FL_mps;
       vofa_buf[1] = speed_FR_mps;
@@ -251,7 +263,7 @@ void StartTaskChassis(void const * argument)
       vofa_buf[4] = *(float*)&tail;
       HAL_UART_Transmit(&huart1, (uint8_t*)vofa_buf, sizeof(vofa_buf), 10);
 
-      // E.【系统节奏】
+      // ── I. 系统节奏 100Hz ──
       osDelay(10);
   }
   /* USER CODE END StartTaskChassis */
@@ -285,8 +297,12 @@ void StartTaskVision(void const * argument)
               uint8_t checksum = k210_buf[1] ^ k210_buf[2] ^ k210_buf[3]
                                ^ k210_buf[4] ^ k210_buf[5];
               if (checksum == k210_buf[6]) {
-                  // 帧有效，推入消息队列给 Task_PID_Ctrl 消费
-                  osMessagePut(Queue_VisionDataHandle, *(uint32_t*)&k210_buf, 0);
+                  // 打包 Class/X/Y/Area → uint32_t 推入队列
+                  uint32_t packed = ((uint32_t)k210_buf[1] << 0)
+                                  | ((uint32_t)k210_buf[2] << 8)
+                                  | ((uint32_t)k210_buf[3] << 16)
+                                  | ((uint32_t)k210_buf[4] << 24);
+                  osMessagePut(Queue_VisionDataHandle, packed, 0);
               }
           }
       }
@@ -305,10 +321,33 @@ void StartTaskVision(void const * argument)
 void StartTaskSensor(void const * argument)
 {
   /* USER CODE BEGIN StartTaskSensor */
-  /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+      // 读 8 路红外 PE0~PE7
+      SensorData_t sensor;
+      uint32_t idr = GPIOE->IDR;
+      sensor.ir[0] = (idr & GPIO_PIN_0) ? 1 : 0;
+      sensor.ir[1] = (idr & GPIO_PIN_1) ? 1 : 0;
+      sensor.ir[2] = (idr & GPIO_PIN_2) ? 1 : 0;
+      sensor.ir[3] = (idr & GPIO_PIN_3) ? 1 : 0;
+      sensor.ir[4] = (idr & GPIO_PIN_4) ? 1 : 0;
+      sensor.ir[5] = (idr & GPIO_PIN_5) ? 1 : 0;
+      sensor.ir[6] = (idr & GPIO_PIN_6) ? 1 : 0;
+      sensor.ir[7] = (idr & GPIO_PIN_7) ? 1 : 0;
+      sensor.distance_cm = 300.0f; // TODO: HC-SR04 实测值
+
+      // 互斥锁写入
+      if (osMutexWait(Mutex_SensorDataHandle, osWaitForever) == osOK) {
+          g_sensor_data = sensor;
+          osMutexRelease(Mutex_SensorDataHandle);
+      }
+
+      // 超声波紧急刹车判断
+      if (sensor.distance_cm < 15.0f) {
+          g_emergency_stop = 1;
+      }
+
+      osDelay(20); // 50Hz
   }
   /* USER CODE END StartTaskSensor */
 }

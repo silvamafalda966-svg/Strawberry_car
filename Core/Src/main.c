@@ -26,9 +26,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "bsp_motor.h"  // 引入你自己写的底层电机驱动库
+#include "bsp_motor.h"
 #include "pid.h"
- 
+#include "chassis.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -109,7 +109,8 @@ int main(void)
   
   // 1. 唤醒 PWM 动力系统
   Motor_Init();
-  PID_Init(); // 唤醒四个轮子的 PID 控制器大脑
+  PID_Init();
+  Chassis_Init();
   // 2. 唤醒 四路编码器测速系统
   HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL); // 左前 (FL)
   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL); // 左后 (BL)
