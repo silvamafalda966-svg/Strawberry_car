@@ -86,14 +86,14 @@ void Chassis_VOFA_Parse(const uint8_t *cmd_buf) {
     if (cmd_buf[0] == '\0') return;
 
     // ── M 命令：强制切状态（所有状态可用） ──
+    // 映射: MD→DEBUG, M0→IDLE, M1→LINE_FOLLOW, ..., M8→FINISH
     if (cmd_buf[0] == 'M') {
         if (cmd_buf[1] == 'D') {
             g_chassis_state = STATE_DEBUG;
-        } else if (cmd_buf[1] >= '0' && cmd_buf[1] <= '9') {
-            uint8_t target = cmd_buf[1] - '0';
-            if (target < STATE_COUNT) {
-                g_chassis_state = (ChassisState_t)target;
-            }
+        } else if (cmd_buf[1] >= '0' && cmd_buf[1] <= '8') {
+            g_chassis_state = (ChassisState_t)(cmd_buf[1] - '0' + 1);
+        } else if (cmd_buf[1] == '9') {
+            g_chassis_state = STATE_FINISH;
         }
         return;
     }
