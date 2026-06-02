@@ -169,7 +169,7 @@ void StartTaskChassis(void const * argument)
   pid_FL.direction = 1; pid_FL.Kp = 0.35f; pid_FL.Ki = 0.06f; pid_FL.Kd = 0.04f; pid_FL.Target = 0.0f;
   pid_BL.direction = 1; pid_BL.Kp = 0.35f; pid_BL.Ki = 0.06f; pid_BL.Kd = 0.04f; pid_BL.Target = 0.0f;
   pid_FR.direction = 1; pid_FR.Kp = 0.35f; pid_FR.Ki = 0.06f; pid_FR.Kd = 0.04f; pid_FR.Target = 0.0f;
-  pid_BR.direction = 1; pid_BR.Kp = 0.35f; pid_BR.Ki = 0.06f; pid_BR.Kd = 0.04f; pid_BR.Target = 0.0f;
+  pid_BR.direction = 1; pid_BR.Kp = 0.50f; pid_BR.Ki = 0.04f; pid_BR.Kd = 0.04f; pid_BR.Target = 0.0f;
 
   // 2. 启动 USART1 VOFA+ 中断
   extern UART_HandleTypeDef huart1;
@@ -203,6 +203,11 @@ void StartTaskChassis(void const * argument)
       __HAL_TIM_SET_COUNTER(&htim8, 0);
       speed_BR_mps = (float)dBR * 0.0003694f;
 
+      // ── 累积编码器里程（四轮均值，有符号） ──
+      g_enc_total += (int32_t)(dFL + dFR + dBL + dBR) / 4;
+      // ── 四轮编码器绝对值累加（用于精算转角，不受方向影响） ──
+      g_turn_enc += (int32_t)(abs(dFL) + abs(dFR) + abs(dBL) + abs(dBR));
+
       // ── C. 视觉队列检查（仅需 K210 的状态才取队列） ──
       VisionData_t vis_frame;
       uint8_t has_vision = 0;
@@ -229,8 +234,8 @@ void StartTaskChassis(void const * argument)
           osMutexRelease(Mutex_SensorDataHandle);
       }
 
-      // ── E. 紧急刹车检查 ──
-      if (g_emergency_stop) {
+      // ── E. 紧急刹车检查（避障中不重复触发） ──
+      if (g_emergency_stop && g_chassis_state != STATE_OBSTACLE) {
           Chassis_Stop();
           g_chassis_state = STATE_OBSTACLE;
           if (speed_FL_mps < 0.03f && speed_FL_mps > -0.03f &&
@@ -257,14 +262,23 @@ void StartTaskChassis(void const * argument)
       Motor_BL_SetSpeed((int)pwm_BL);
       Motor_BR_SetSpeed((int)pwm_BR);
 
-      // ── H. VOFA+ 上传 ──
-      float vofa_buf[5];
+      // ── H. VOFA+ 上传（8 通道：4轮速度 + IR字节 + 黑点数 + g_enc_total + 帧尾） ──
+      float vofa_buf[8];
       vofa_buf[0] = speed_FL_mps;
       vofa_buf[1] = speed_FR_mps;
       vofa_buf[2] = speed_BL_mps;
       vofa_buf[3] = speed_BR_mps;
+      uint8_t ir_byte = 0;
+      for (int i = 0; i < 8; i++) {
+          if (local_sensor.ir[i]) ir_byte |= (1 << i);
+      }
+      vofa_buf[4] = (float)ir_byte;
+      int bc = 0;
+      for (int i = 0; i < 8; i++) { if (local_sensor.ir[i] == 0) bc++; }
+      vofa_buf[5] = (float)bc;
+      vofa_buf[6] = (float)g_enc_total;
       uint32_t tail = 0x7F800000;
-      vofa_buf[4] = *(float*)&tail;
+      vofa_buf[7] = *(float*)&tail;
       HAL_UART_Transmit(&huart1, (uint8_t*)vofa_buf, sizeof(vofa_buf), 10);
 
       // ── I. 系统节奏 100Hz ──
@@ -346,10 +360,12 @@ void StartTaskSensor(void const * argument)
           osMutexRelease(Mutex_SensorDataHandle);
       }
 
-      // 超声波紧急刹车判断
+      // 超声波紧急刹车判断（空转测试时通过 ENABLE_ULTRASONIC=0 禁用）
+#if ENABLE_ULTRASONIC
       if (sensor.distance_cm < 15.0f) {
           g_emergency_stop = 1;
       }
+#endif
 
       osDelay(20); // 50Hz
   }
@@ -366,10 +382,16 @@ void StartTaskSensor(void const * argument)
 void StartTaskOLED(void const * argument)
 {
   /* USER CODE BEGIN StartTaskOLED */
-  /* Infinite loop */
+  /* Phase 2: OLED 驱动待 B 传感队友实现。
+     当前用蜂鸣器心跳指示系统存活（200ms 周期短促蜂鸣）。
+     TODO: 替换为 I2C OLED 显示状态、红/绿计数、编码器里程 */
   for(;;)
   {
-    osDelay(1);
+    // 蜂鸣器短促心跳
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+    osDelay(50);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+    osDelay(150); // 5Hz 心跳
   }
   /* USER CODE END StartTaskOLED */
 }

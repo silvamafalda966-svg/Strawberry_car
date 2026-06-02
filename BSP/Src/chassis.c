@@ -241,9 +241,13 @@ static ChassisState_t run_line_follow(const SensorData_t *s,
     }
 
     /* ── 2. P 控制器 → 差速转向 ── */
+#if FORCE_STRAIGHT
+    Chassis_MoveForward(LINE_BASE_SPEED);  // 空转测试：忽略红外，纯直行
+#else
     float turn_corr = line_err * LINE_KP;
     float speed = (black_cnt == 0) ? 0.15f : LINE_BASE_SPEED; // 丢线降速
     Chassis_DiffTurn(speed, turn_corr);
+#endif
 
     /* ── 3. 视觉检测 ── */
     if (hv && v != NULL) {
