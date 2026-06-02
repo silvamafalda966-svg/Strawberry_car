@@ -53,6 +53,42 @@ extern uint32_t           g_state_ticks;
 extern int32_t            g_last_picked_enc;
 extern int32_t            g_skip_until_enc;
 extern uint8_t            g_skip_strawberry;
+extern uint16_t           g_red_count;       // 红草莓采摘计数
+extern uint16_t           g_green_count;     // 绿草莓识别计数
+extern int32_t            g_enc_total;       // 四轮编码器累积均值（有符号，前+后-）
+extern int32_t            g_turn_enc;        // 四轮编码器绝对值累加（用于精算转角）
+
+/* ────────── 避障子阶段枚举 ────────── */
+typedef enum {
+    OB_STOP = 0,        // 急停等四轮归零
+    OB_BACK,            // 后退 10cm
+    OB_TURN_RIGHT,      // 右转 90°
+    OB_CROSS,           // 横行 25cm（记录编码器距离）
+    OB_TURN_LEFT1,      // 左转 90°（恢复朝前）
+    OB_FORWARD,         // 直行 30cm
+    OB_TURN_LEFT2,      // 左转 90°（车头朝左，正对黑线）
+    OB_RETURN,          // 回线 N cm（= 记忆的横行距离）
+    OB_TURN_45,         // 右转 45° 斜向朝线
+    OB_FORWARD_TO_LINE, // 直行直到红外发现黑线
+    OB_DONE             // 哨兵：避障完成
+} ObsSubStage_t;
+
+/* ────────── Phase 2 可调参数 ────────── */
+#define LINE_KP             0.04f   // 巡线 P 控制器比例系数
+#define LINE_BASE_SPEED     0.3f    // 巡线基准速度 (m/s)
+#define OB_BACK_SPEED       0.2f    // 避障后退速度 (m/s)
+#define OB_FWD_SPEED        0.3f    // 避障前进速度 (m/s)
+#define OB_TURN_SPEED       0.15f   // 避障原地旋转速度 (m/s) — 低速封印
+#define OB_TURN_MS          800     // 避障转 90° 计时上限 (ms)，编码器优先
+#define OB_BACK_CM          10.0f   // 后退距离 (cm)
+#define OB_CROSS_CM         25.0f   // 横行绕过距离 (cm)
+#define OB_FORWARD_CM       30.0f   // 直行超越距离 (cm)
+#define SUPPRESS_CM         20.0f   // 抑制区距离 (cm)
+#define ENC_PER_CM          2707    // 编码器计数/cm ≈ 270709/m ÷ 100
+#define TURN90_TOTAL_ENC    118200  // 四轮绝对值累加 = 90°（轮距 13.9cm）
+#define TURN45_TOTAL_ENC    59100   // 四轮绝对值累加 = 45°
+#define OB_FWD_TO_LINE_CM   50.0f   // 斜向朝线直行最长距离 (cm)，红外兜底
+#define OB_BRAKE_TIMEOUT    100     // 阶段间刹车最长等待 (10ms*100=1s)，四轮归零提前退出
 
 /* ────────── Chassis_Move API（只设 Target，不碰 PWM） ────────── */
 void Chassis_MoveForward(float speed_mps);

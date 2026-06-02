@@ -65,9 +65,9 @@ void PID_Init(void)
     pid_BR.err_prev2 = 0.0f;
     pid_BR.direction = 1;       // 右后: 正向
     pid_BR.stall_cnt = 0;
-    pid_BR.Kp = 0.35f;
-    pid_BR.Ki = 0.06f;
-    pid_BR.Kd = 0.04f;
+    pid_BR.Kp = 0.75f;
+    pid_BR.Ki = 0.07f;
+    pid_BR.Kd = 0.01f;
     pid_BR.out_PWM = 0.0f;
     pid_BR.max_out_PWM = 999.0f;   
     pid_BR.min_out_PWM = -999.0f;  
@@ -105,5 +105,6 @@ float PID_Incremental_Calc(PID_TypeDef *pid, float actual_speed)
     }
 
     // 返回经过保护后、准备下发给电机的最终 PWM 占空比
-    return pid->out_PWM; 
+    return pid->out_PWM;
 }
+
