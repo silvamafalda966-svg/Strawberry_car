@@ -72,6 +72,7 @@ osMutexId Mutex_SensorDataHandle;
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 static float CalcOneWheel(PID_TypeDef *pid, float speed_mps);
+static void HC_SR04_Trigger(void);
 /* USER CODE END FunctionPrototypes */
 
 void StartTaskChassis(void const * argument);
@@ -155,6 +156,40 @@ void MX_FREERTOS_Init(void) {
 
 }
 
+/* ── HC-SR04 超声波测距（TIM3 CH4 输入捕获中断，零阻塞）── */
+static volatile float g_ultrasonic_cm = 300.0f; // ISR 写入，PID 任务读取
+static uint32_t ic_val1 = 0;                    // 上升沿捕获值
+static uint8_t  ic_phase = 0;                   // 0=待上升沿, 1=待下降沿
+
+static void HC_SR04_Trigger(void)
+{
+    ic_phase = 0;
+    __HAL_TIM_SET_CAPTUREPOLARITY(&htim3, TIM_CHANNEL_4, TIM_INPUTCHANNELPOLARITY_RISING);
+    HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_4);
+
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);
+    for (volatile int i = 0; i < 280; i++) { __NOP(); } // ~10µs @168MHz
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
+}
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance != TIM3 || htim->Channel != HAL_TIM_ACTIVE_CHANNEL_4) return;
+
+    if (ic_phase == 0) {
+        ic_val1 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_4);
+        __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_4, TIM_INPUTCHANNELPOLARITY_FALLING);
+        ic_phase = 1;
+    } else {
+        uint32_t ic_val2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_4);
+        uint32_t pulse_us = (ic_val2 >= ic_val1) ? (ic_val2 - ic_val1)
+                                                  : (65535 - ic_val1 + ic_val2 + 1);
+        g_ultrasonic_cm = (float)pulse_us / 58.0f;
+        HAL_TIM_IC_Stop_IT(htim, TIM_CHANNEL_4);
+        ic_phase = 0;
+    }
+}
+
 /* USER CODE BEGIN Header_StartTaskChassis */
 /**
   * @brief  Function implementing the Task_PID_Ctrl thread.
@@ -234,8 +269,26 @@ void StartTaskChassis(void const * argument)
           osMutexRelease(Mutex_SensorDataHandle);
       }
 
-      // ── E. 紧急刹车检查（避障中不重复触发） ──
-      if (g_emergency_stop && g_chassis_state != STATE_OBSTACLE) {
+      // ── D2. 超声波测距（中断驱动，零阻塞；20Hz 触发一次） ──
+#if ENABLE_ULTRASONIC
+      static uint8_t ultra_tick = 0;
+      if (++ultra_tick >= 5) {
+          ultra_tick = 0;
+          HC_SR04_Trigger();
+      }
+      local_sensor.distance_cm = g_ultrasonic_cm; // ISR 异步更新
+      // 急停标志位：仅在 LINE_FOLLOW 中生效
+      if (g_chassis_state == STATE_LINE_FOLLOW) {
+          if (local_sensor.distance_cm < 15.0f) {
+              g_emergency_stop = 1;
+          } else {
+              g_emergency_stop = 0;
+          }
+      }
+#endif
+
+      // ── E. 紧急刹车执行（仅 LINE_FOLLOW 巡线中触发） ──
+      if (g_emergency_stop && g_chassis_state == STATE_LINE_FOLLOW) {
           Chassis_Stop();
           g_chassis_state = STATE_OBSTACLE;
           if (speed_FL_mps < 0.03f && speed_FL_mps > -0.03f &&
@@ -262,7 +315,7 @@ void StartTaskChassis(void const * argument)
       Motor_BL_SetSpeed((int)pwm_BL);
       Motor_BR_SetSpeed((int)pwm_BR);
 
-      // ── H. VOFA+ 上传（8 通道：4轮速度 + IR字节 + 黑点数 + g_enc_total + 帧尾） ──
+      // ── H. VOFA+ 上传（8 通道：4轮速度 + IR字节 + 超声波距离 + 编码器里程 + 帧尾） ──
       float vofa_buf[8];
       vofa_buf[0] = speed_FL_mps;
       vofa_buf[1] = speed_FR_mps;
@@ -273,9 +326,7 @@ void StartTaskChassis(void const * argument)
           if (local_sensor.ir[i]) ir_byte |= (1 << i);
       }
       vofa_buf[4] = (float)ir_byte;
-      int bc = 0;
-      for (int i = 0; i < 8; i++) { if (local_sensor.ir[i] == 0) bc++; }
-      vofa_buf[5] = (float)bc;
+      vofa_buf[5] = local_sensor.distance_cm;
       vofa_buf[6] = (float)g_enc_total;
       uint32_t tail = 0x7F800000;
       vofa_buf[7] = *(float*)&tail;
@@ -341,7 +392,7 @@ void StartTaskSensor(void const * argument)
   /* USER CODE BEGIN StartTaskSensor */
   for(;;)
   {
-      // 读 8 路红外 PE0~PE7
+      // 读 8 路红外 PE0~PE7（不读超声波，避免阻塞抢占 PID 任务）
       SensorData_t sensor;
       uint32_t idr = GPIOE->IDR;
       sensor.ir[0] = (idr & GPIO_PIN_0) ? 1 : 0;
@@ -352,20 +403,13 @@ void StartTaskSensor(void const * argument)
       sensor.ir[5] = (idr & GPIO_PIN_5) ? 1 : 0;
       sensor.ir[6] = (idr & GPIO_PIN_6) ? 1 : 0;
       sensor.ir[7] = (idr & GPIO_PIN_7) ? 1 : 0;
-      sensor.distance_cm = 300.0f; // TODO: HC-SR04 实测值
+      sensor.distance_cm = 300.0f; // 由 PID 任务实测，此处占位
 
       // 互斥锁写入
       if (osMutexWait(Mutex_SensorDataHandle, osWaitForever) == osOK) {
           g_sensor_data = sensor;
           osMutexRelease(Mutex_SensorDataHandle);
       }
-
-      // 超声波紧急刹车判断（空转测试时通过 ENABLE_ULTRASONIC=0 禁用）
-#if ENABLE_ULTRASONIC
-      if (sensor.distance_cm < 15.0f) {
-          g_emergency_stop = 1;
-      }
-#endif
 
       osDelay(20); // 50Hz
   }

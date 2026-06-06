@@ -89,8 +89,8 @@ typedef enum {
 #define TURN45_TOTAL_ENC    59100   // 四轮绝对值累加 = 45°
 #define OB_FWD_TO_LINE_CM   50.0f   // 斜向朝线直行最长距离 (cm)，红外兜底
 #define OB_BRAKE_TIMEOUT    100     // 阶段间刹车最长等待 (10ms*100=1s)，四轮归零提前退出
-#define ENABLE_ULTRASONIC   0       // 超声波使能: 1=接硬件, 0=空转测试禁用
-#define FORCE_STRAIGHT      1       // 强制直行: 1=忽略红外差速, 0=正常巡线
+#define ENABLE_ULTRASONIC   1       // 超声波使能: 1=接硬件, 0=空转测试禁用
+#define FORCE_STRAIGHT      0       // 强制直行: 1=忽略红外差速, 0=正常巡线
 
 /* ────────── Chassis_Move API（只设 Target，不碰 PWM） ────────── */
 void Chassis_MoveForward(float speed_mps);
