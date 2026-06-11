@@ -57,11 +57,9 @@ uint8_t rx_buf[32];
 uint8_t rx_index = 0;
 volatile uint8_t rx_flag = 0;
 uint8_t rx_byte;
-// K210 8字节帧解析状态机
-uint8_t  k210_buf[8];
-uint8_t  k210_idx = 0;
-uint8_t  k210_sync = 0;
-volatile uint8_t k210_ready = 0;
+// K210 DMA 定长 24B 接收缓冲区
+uint8_t  k210_dma_buf[24];
+volatile uint8_t k210_frame_ready = 0;  // IDLE 中断置位，PID任务消费
 // 传感器数据（Task_Sensor 写，Task_PID_Ctrl 读）
 static SensorData_t g_sensor_data = {{0}, 300.0f};
 /* USER CODE END Variables */
@@ -69,7 +67,7 @@ osThreadId Task_PID_CtrlHandle;
 osThreadId Task_VisionHandle;
 osThreadId Task_SensorHandle;
 osThreadId Task_OLEDHandle;
-osMessageQId Queue_VisionDataHandle;
+QueueHandle_t xQueue_VisionData;   // 24B 定长帧队列（FreeRTOS 原生）
 osMutexId Mutex_SensorDataHandle;
 
 /* Private function prototypes -----------------------------------------------*/
@@ -128,9 +126,8 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* Create the queue(s) */
-  /* definition and creation of Queue_VisionData */
-  osMessageQDef(Queue_VisionData, 2, sizeof(uint32_t));
-  Queue_VisionDataHandle = osMessageCreate(osMessageQ(Queue_VisionData), NULL);
+  /* K210 24B 定长帧队列（深度 2） */
+  xQueue_VisionData = xQueueCreate(2, 24);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -249,18 +246,23 @@ void StartTaskChassis(void const * argument)
       g_turn_enc += (int32_t)(abs(dFL) + abs(dFR) + abs(dBL) + abs(dBR));
 
       // ── C. 视觉队列检查（仅需 K210 的状态才取队列） ──
-      VisionData_t vis_frame;
+      VisionFrame_t vis_frame;
+      memset(&vis_frame, 0, sizeof(vis_frame));
       uint8_t has_vision = 0;
       if (g_chassis_state == STATE_LINE_FOLLOW ||
           g_chassis_state == STATE_BREAKAWAY ||
-          g_chassis_state == STATE_VISUAL_APPROACH) {
-          osEvent evt = osMessageGet(Queue_VisionDataHandle, 0);
-          if (evt.status == osEventMessage) {
-              uint32_t raw = evt.value.v;
-              vis_frame.class_id = (raw >> 0)  & 0xFF;
-              vis_frame.x        = (raw >> 8)  & 0xFF;
-              vis_frame.y        = (raw >> 16) & 0xFF;
-              vis_frame.area     = (raw >> 24) & 0xFF;
+          g_chassis_state == STATE_VISUAL_APPROACH ||
+          g_chassis_state == STATE_SCANNING) {
+          uint8_t raw[24];
+          if (xQueueReceive(xQueue_VisionData, raw, 0) == pdTRUE) {
+              // 解析定长 24B 帧 → VisionFrame_t
+              vis_frame.count = raw[1];
+              for (int i = 0; i < 5; i++) {
+                  vis_frame.t[i].cls  = raw[2 + i*4 + 0];
+                  vis_frame.t[i].x    = raw[2 + i*4 + 1];
+                  vis_frame.t[i].y    = raw[2 + i*4 + 2];
+                  vis_frame.t[i].area = raw[2 + i*4 + 3];
+              }
               has_vision = 1;
           }
       }
@@ -337,7 +339,8 @@ void StartTaskChassis(void const * argument)
       vofa_buf[7] = *(float*)&tail;
       HAL_UART_Transmit(&huart1, (uint8_t*)vofa_buf, sizeof(vofa_buf), 10);
 
-      // ── I. 系统节奏 100Hz ──
+      // ── I. 全局滴答 + 系统节奏 100Hz ──
+      g_sys_tick++;
       osDelay(10);
   }
   /* USER CODE END StartTaskChassis */
@@ -354,33 +357,17 @@ void StartTaskVision(void const * argument)
 {
   /* USER CODE BEGIN StartTaskVision */
     extern UART_HandleTypeDef huart2;
-    extern osMessageQId Queue_VisionDataHandle;
-    extern volatile uint8_t k210_ready;
-    extern uint8_t k210_buf[8];
 
-    // 启动 USART2 中断接收，用于 K210 视觉数据
-    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+    // 启动 USART2 DMA + IDLE 接收（定长 24B 帧）
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, k210_dma_buf, 24);
+    // ⚠️ 关键：关闭半传输中断，防止 12 字节时误触发
+    __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
 
     for(;;)
     {
-      if (k210_ready) {
-          k210_ready = 0;
-
-          // 校验 8 字节帧: 0xAA + Class + X + Y + Area + Reserved + Checksum + 0x55
-          if (k210_buf[0] == 0xAA && k210_buf[7] == 0x55) {
-              uint8_t checksum = k210_buf[1] ^ k210_buf[2] ^ k210_buf[3]
-                               ^ k210_buf[4] ^ k210_buf[5];
-              if (checksum == k210_buf[6]) {
-                  // 打包 Class/X/Y/Area → uint32_t 推入队列
-                  uint32_t packed = ((uint32_t)k210_buf[1] << 0)
-                                  | ((uint32_t)k210_buf[2] << 8)
-                                  | ((uint32_t)k210_buf[3] << 16)
-                                  | ((uint32_t)k210_buf[4] << 24);
-                  osMessagePut(Queue_VisionDataHandle, packed, 0);
-              }
-          }
-      }
-      osDelay(10); // 100Hz 检查频率
+      // k210_frame_ready 由 IDLE 中断回调置位
+      // 此处仅做看门狗/心跳，实际数据在 IDLE 回调中已入队
+      osDelay(10);
     }
   /* USER CODE END StartTaskVision */
 }
@@ -433,7 +420,9 @@ void StartTaskOLED(void const * argument)
   /* USER CODE BEGIN StartTaskOLED */
   OLED_Init();
 
-  /* ── 状态名 ↔ 中文字库索引映射 ── */
+  /* ── 状态名 ↔ 中文字库索引映射 ──
+     注：新增 STATE_SCANNING(扫描) 暂用 ASCII "SC" 显示，
+     待扩充字库后改为中文。索引已重新映射。 */
   static const uint8_t state_cn_idx[STATE_COUNT][2] = {
       [STATE_DEBUG]           = {HZK_00, HZK_01},  /* 调试 */
       [STATE_IDLE]            = {HZK_02, HZK_03},  /* 待机 */
@@ -442,6 +431,7 @@ void StartTaskOLED(void const * argument)
       [STATE_GREEN_FILTER]    = {HZK_08, HZK_09},  /* 绿滤 */
       [STATE_BREAKAWAY]       = {HZK_10, HZK_11},  /* 脱离 */
       [STATE_VISUAL_APPROACH] = {HZK_12, HZK_13},  /* 接近 */
+      [STATE_SCANNING]        = {HZK_29, HZK_30},  /* 扫描 */
       [STATE_DOCKING]         = {HZK_14, HZK_15},  /* 对接 */
       [STATE_BLIND_RETURN]    = {HZK_16, HZK_17},  /* 盲返 */
       [STATE_FINISH]          = {HZK_18, HZK_19},  /* 完成 */
@@ -457,8 +447,14 @@ void StartTaskOLED(void const * argument)
           /* ─── OLED 正常：显示全部信息 ─── */
           OLED_ClearBuffer();
 
-          OLED_ShowChinese(0, 0, state_cn_idx[g_chassis_state][0]);
-          OLED_ShowChinese(18, 0, state_cn_idx[g_chassis_state][1]);
+          // 状态名（中文）
+          if (state_cn_idx[g_chassis_state][0] != 0xFF) {
+              OLED_ShowChinese(0, 0, state_cn_idx[g_chassis_state][0]);
+              OLED_ShowChinese(18, 0, state_cn_idx[g_chassis_state][1]);
+          } else {
+              // STATE_SCANNING ASCII fallback
+              OLED_ShowString(0, 0, (uint8_t*)"SCAN", 16, 1);
+          }
 
           OLED_ShowString(0, 18, (uint8_t*)"R:", 16, 1);
           OLED_ShowNum(24, 18, g_red_count, 3, 16, 1);
@@ -478,19 +474,28 @@ void StartTaskOLED(void const * argument)
 
           OLED_Refresh();
 
-          /* 蜂鸣器短促心跳 */
-          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
-          osDelay(20);
-          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
-          osDelay(180);  /* 5Hz */
+          /* 蜂鸣器：DOCKING 时由 chassis.c run_docking 直接控制；
+             其他状态保持心跳蜂鸣 */
+          if (g_chassis_state != STATE_DOCKING) {
+              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+              osDelay(20);
+              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+              osDelay(180);  /* 5Hz */
+          } else {
+              osDelay(200);  /* DOCKING 时 OLED 跳过蜂鸣，仅刷新 */
+          }
       }
       else
       {
           /* ─── OLED 故障：降级为蜂鸣器心跳 + 定期重试 ─── */
-          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
-          osDelay(50);
-          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
-          osDelay(150);
+          if (g_chassis_state != STATE_DOCKING) {
+              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+              osDelay(50);
+              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+              osDelay(150);
+          } else {
+              osDelay(200);  /* DOCKING 时不碰蜂鸣 */
+          }
 
           /* 每 ~3 秒重试初始化 */
           if (++retry_tick >= 15) {
@@ -508,15 +513,10 @@ void StartTaskOLED(void const * argument)
 /* USER CODE BEGIN Application */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    // 定义外部变量，让函数认识它们
     extern uint8_t rx_buf[32];
     extern uint8_t rx_index;
     extern volatile uint8_t rx_flag;
     extern uint8_t rx_byte;
-    extern uint8_t k210_buf[8];
-    extern uint8_t k210_idx;
-    extern uint8_t k210_sync;
-    extern volatile uint8_t k210_ready;
 
     // ── USART1: VOFA+ 文本命令行（'\n' 换行结束） ──
     if (huart->Instance == USART1) {
@@ -533,27 +533,33 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
         HAL_UART_Receive_IT(huart, &rx_byte, 1);
     }
-    // ── USART2: K210 8字节二进制帧（0xAA...0x55） ──
-    else if (huart->Instance == USART2) {
-        if (k210_sync == 0) {
-            // 等待帧头 0xAA
-            if (rx_byte == 0xAA) {
-                k210_sync = 1;
-                k210_idx = 0;
-                k210_buf[k210_idx++] = rx_byte; // 存 0xAA
-            }
-        } else {
-            // 收字节 1~7
-            k210_buf[k210_idx++] = rx_byte;
-            if (k210_idx >= 8) {
-                k210_sync = 0;
-                if (k210_buf[7] == 0x55) {
-                    k210_ready = 1; // 帧尾正确，通知 Task_Vision
-                }
+    // USART2 已改用 DMA + IDLE，不再走逐字节中断
+}
+
+/* ── USART2 DMA + IDLE 接收完成回调 ── */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    if (huart->Instance != USART2) return;
+
+    if (Size == 24) {
+        // 校验帧头帧尾
+        if (k210_dma_buf[0] == 0xAA && k210_dma_buf[23] == 0x55) {
+            // XOR 校验：Count + 20B Target = 21 字节
+            uint8_t x = 0;
+            for (int i = 1; i <= 21; i++) x ^= k210_dma_buf[i];
+            if (x == k210_dma_buf[22]) {
+                // 校验通过 → 24B 完整帧入队
+                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                xQueueSendFromISR(xQueue_VisionData, k210_dma_buf,
+                                  &xHigherPriorityTaskWoken);
+                portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
             }
         }
-        HAL_UART_Receive_IT(huart, &rx_byte, 1);
     }
+
+    // 重启 IDLE 接收
+    HAL_UARTEx_ReceiveToIdle_DMA(huart, k210_dma_buf, 24);
+    __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
 }
 /**
   * @brief  单轮 PID 计算 + 停车锁死策略（四轮共用）
