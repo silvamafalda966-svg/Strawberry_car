@@ -56,6 +56,7 @@ extern uint8_t            g_skip_strawberry;
 extern uint16_t           g_red_count;       // 红草莓采摘计数
 extern uint16_t           g_green_count;     // 绿草莓识别计数
 extern int32_t            g_enc_total;       // 四轮编码器累积均值（有符号，前+后-）
+extern float              g_avg_speed_mps;   // 四轮平均速度 (m/s)，Task_OLED 读取
 extern int32_t            g_turn_enc;        // 四轮编码器绝对值累加（用于精算转角）
 
 /* ────────── 避障子阶段枚举 ────────── */

@@ -17,6 +17,7 @@ uint16_t           g_red_count      = 0;
 uint16_t           g_green_count    = 0;
 int32_t            g_enc_total      = 0;
 int32_t            g_turn_enc       = 0;
+float              g_avg_speed_mps  = 0.0f;
 
 /* ══════════════════════════════════════════════════════════════════════
    Phase 2 文件级持久状态（entry 函数复位，run 函数使用）

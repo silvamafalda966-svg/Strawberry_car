@@ -617,6 +617,11 @@
               <FileType>1</FileType>
               <FilePath>..\BSP\Src\chassis.c</FilePath>
             </File>
+            <File>
+              <FileName>oled.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\BSP\Src\oled.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

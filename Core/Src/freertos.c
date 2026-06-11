@@ -29,8 +29,11 @@
 #include "bsp_motor.h"
 #include "chassis.h"
 #include "tim.h"
+#include "oled.h"
+#include "oledfont.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -237,6 +240,8 @@ void StartTaskChassis(void const * argument)
       short dBR = (short)__HAL_TIM_GET_COUNTER(&htim8);
       __HAL_TIM_SET_COUNTER(&htim8, 0);
       speed_BR_mps = (float)dBR * 0.0003694f;
+      g_avg_speed_mps = (fabsf(speed_FL_mps) + fabsf(speed_FR_mps)
+                      +  fabsf(speed_BL_mps) + fabsf(speed_BR_mps)) / 4.0f;
 
       // ── 累积编码器里程（四轮均值，有符号） ──
       g_enc_total += (int32_t)(dFL + dFR + dBL + dBR) / 4;
@@ -426,16 +431,75 @@ void StartTaskSensor(void const * argument)
 void StartTaskOLED(void const * argument)
 {
   /* USER CODE BEGIN StartTaskOLED */
-  /* Phase 2: OLED 驱动待 B 传感队友实现。
-     当前用蜂鸣器心跳指示系统存活（200ms 周期短促蜂鸣）。
-     TODO: 替换为 I2C OLED 显示状态、红/绿计数、编码器里程 */
+  OLED_Init();
+
+  /* ── 状态名 ↔ 中文字库索引映射 ── */
+  static const uint8_t state_cn_idx[STATE_COUNT][2] = {
+      [STATE_DEBUG]           = {HZK_00, HZK_01},  /* 调试 */
+      [STATE_IDLE]            = {HZK_02, HZK_03},  /* 待机 */
+      [STATE_LINE_FOLLOW]     = {HZK_04, HZK_05},  /* 巡线 */
+      [STATE_OBSTACLE]        = {HZK_06, HZK_07},  /* 避障 */
+      [STATE_GREEN_FILTER]    = {HZK_08, HZK_09},  /* 绿滤 */
+      [STATE_BREAKAWAY]       = {HZK_10, HZK_11},  /* 脱离 */
+      [STATE_VISUAL_APPROACH] = {HZK_12, HZK_13},  /* 接近 */
+      [STATE_DOCKING]         = {HZK_14, HZK_15},  /* 对接 */
+      [STATE_BLIND_RETURN]    = {HZK_16, HZK_17},  /* 盲返 */
+      [STATE_FINISH]          = {HZK_18, HZK_19},  /* 完成 */
+  };
+
+  uint8_t heartbeat = 0;
+  uint8_t retry_tick = 0;
+
   for(;;)
   {
-    // 蜂鸣器短促心跳
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
-    osDelay(50);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
-    osDelay(150); // 5Hz 心跳
+      if (OLED_IsOK())
+      {
+          /* ─── OLED 正常：显示全部信息 ─── */
+          OLED_ClearBuffer();
+
+          OLED_ShowChinese(0, 0, state_cn_idx[g_chassis_state][0]);
+          OLED_ShowChinese(18, 0, state_cn_idx[g_chassis_state][1]);
+
+          OLED_ShowString(0, 18, (uint8_t*)"R:", 16, 1);
+          OLED_ShowNum(24, 18, g_red_count, 3, 16, 1);
+          OLED_ShowString(64, 18, (uint8_t*)"G:", 16, 1);
+          OLED_ShowNum(88, 18, g_green_count, 3, 16, 1);
+
+          OLED_ShowString(0, 36, (uint8_t*)"V:", 16, 1);
+          OLED_ShowFloat(24, 36, g_avg_speed_mps, 16, 1);
+          OLED_ShowString(96, 36, (uint8_t*)"m/s", 16, 1);
+
+          if (g_emergency_stop) {
+              OLED_ShowString(0, 54, (uint8_t*)"VOFA:OK !STOP!", 8, 1);
+          } else {
+              OLED_ShowString(0, 54, (uint8_t*)"VOFA:OK", 8, 1);
+          }
+          OLED_ShowChar(120, 54, (heartbeat & 1) ? '*' : '.', 8, 1);
+
+          OLED_Refresh();
+
+          /* 蜂鸣器短促心跳 */
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+          osDelay(20);
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+          osDelay(180);  /* 5Hz */
+      }
+      else
+      {
+          /* ─── OLED 故障：降级为蜂鸣器心跳 + 定期重试 ─── */
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+          osDelay(50);
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+          osDelay(150);
+
+          /* 每 ~3 秒重试初始化 */
+          if (++retry_tick >= 15) {
+              retry_tick = 0;
+              OLED_Init();
+          }
+      }
+
+      heartbeat++;
   }
   /* USER CODE END StartTaskOLED */
 }
