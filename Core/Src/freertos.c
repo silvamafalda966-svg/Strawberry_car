@@ -74,6 +74,10 @@ osMutexId Mutex_SensorDataHandle;
 /* USER CODE BEGIN FunctionPrototypes */
 static float CalcOneWheel(PID_TypeDef *pid, float speed_mps);
 static void HC_SR04_Trigger(void);
+
+// BR 摩擦前馈 + EMA 滤波系数（运行时可调，F/L 命令）
+float g_br_feedforward   = 40.0f;    // F 命令调整（最优值 40）
+float g_speed_filt_alpha = 0.3f;     // L 命令调整（最优值 0.3）
 /* USER CODE END FunctionPrototypes */
 
 void StartTaskChassis(void const * argument);
@@ -201,10 +205,13 @@ void StartTaskChassis(void const * argument)
 {
   /* USER CODE BEGIN StartTaskChassis */
   // 1. 四轮初始 PID 参数（防死锁）
-  pid_FL.direction = 1; pid_FL.Kp = 0.35f; pid_FL.Ki = 0.06f; pid_FL.Kd = 0.04f; pid_FL.Target = 0.0f;
-  pid_BL.direction = 1; pid_BL.Kp = 0.35f; pid_BL.Ki = 0.06f; pid_BL.Kd = 0.04f; pid_BL.Target = 0.0f;
-  pid_FR.direction = 1; pid_FR.Kp = 0.35f; pid_FR.Ki = 0.06f; pid_FR.Kd = 0.04f; pid_FR.Target = 0.0f;
-  pid_BR.direction = 1; pid_BR.Kp = 0.50f; pid_BR.Ki = 0.04f; pid_BR.Kd = 0.04f; pid_BR.Target = 0.0f;
+  // Systematically tuned 2026-06-13 (Kp→Ki→Kd full sweep)
+  // FL/FR/BL: score=8, rise=96ms, overshoot=0.5%
+  pid_FL.direction = 1; pid_FL.Kp = 0.20f; pid_FL.Ki = 0.08f; pid_FL.Kd = 0.02f; pid_FL.Target = 0.0f;
+  pid_BL.direction = 1; pid_BL.Kp = 0.20f; pid_BL.Ki = 0.08f; pid_BL.Kd = 0.02f; pid_BL.Target = 0.0f;
+  pid_FR.direction = 1; pid_FR.Kp = 0.20f; pid_FR.Ki = 0.08f; pid_FR.Kd = 0.02f; pid_FR.Target = 0.0f;
+  // BR: score=26, rise=107ms, over=1.4%, plateau=95ms (mechanical friction dead zone)
+  pid_BR.direction = 1; pid_BR.Kp = 0.35f; pid_BR.Ki = 0.08f; pid_BR.Kd = 0.10f; pid_BR.Target = 0.0f;
 
   // 2. 启动 USART1 VOFA+ 中断
   extern UART_HandleTypeDef huart1;
@@ -212,6 +219,9 @@ void StartTaskChassis(void const * argument)
 
   // 3. 状态机初始化
   Chassis_Init();
+
+  // EMA 滤波状态（编码器速度低通滤波，降噪）
+  float filt_FL = 0.0f, filt_FR = 0.0f, filt_BL = 0.0f, filt_BR = 0.0f;
 
   for(;;)
   {
@@ -239,6 +249,13 @@ void StartTaskChassis(void const * argument)
       speed_BR_mps = (float)dBR * 0.0003694f;
       g_avg_speed_mps = (fabsf(speed_FL_mps) + fabsf(speed_FR_mps)
                       +  fabsf(speed_BL_mps) + fabsf(speed_BR_mps)) / 4.0f;
+
+      // ── EMA 低通滤波：平滑编码器量化噪声 ──
+      float a = g_speed_filt_alpha;
+      filt_FL = a * filt_FL + (1.0f - a) * speed_FL_mps;
+      filt_FR = a * filt_FR + (1.0f - a) * speed_FR_mps;
+      filt_BL = a * filt_BL + (1.0f - a) * speed_BL_mps;
+      filt_BR = a * filt_BR + (1.0f - a) * speed_BR_mps;
 
       // ── 累积编码器里程（四轮均值，有符号） ──
       g_enc_total += (int32_t)(dFL + dFR + dBL + dBR) / 4;
@@ -311,11 +328,18 @@ void StartTaskChassis(void const * argument)
                                (int32_t)dFL, (int32_t)dFR,
                                (int32_t)dBL, (int32_t)dBR);
 
-      // ── G. PID 计算 + 电机下发（四轮统一） ──
-      float pwm_FL = CalcOneWheel(&pid_FL, speed_FL_mps);
-      float pwm_FR = CalcOneWheel(&pid_FR, speed_FR_mps);
-      float pwm_BL = CalcOneWheel(&pid_BL, speed_BL_mps);
-      float pwm_BR = CalcOneWheel(&pid_BR, speed_BR_mps);
+      // ── G. PID 计算 + 电机下发（四轮统一，使用滤波速度） ──
+      float pwm_FL = CalcOneWheel(&pid_FL, filt_FL);
+      float pwm_FR = CalcOneWheel(&pid_FR, filt_FR);
+      float pwm_BL = CalcOneWheel(&pid_BL, filt_BL);
+      float pwm_BR = CalcOneWheel(&pid_BR, filt_BR);
+
+      // BR 摩擦前馈：克服静摩擦死区，按 ramp_target 方向加固定推力
+      if (pid_BR.ramp_target > 0.01f) {
+          pwm_BR += g_br_feedforward;
+      } else if (pid_BR.ramp_target < -0.01f) {
+          pwm_BR -= g_br_feedforward;
+      }
 
       Motor_FL_SetSpeed((int)pwm_FL);
       Motor_FR_SetSpeed((int)pwm_FR);
@@ -324,10 +348,10 @@ void StartTaskChassis(void const * argument)
 
       // ── H. VOFA+ 上传（8 通道：4轮速度 + IR字节 + 超声波距离 + 编码器里程 + 帧尾） ──
       float vofa_buf[8];
-      vofa_buf[0] = speed_FL_mps;
-      vofa_buf[1] = speed_FR_mps;
-      vofa_buf[2] = speed_BL_mps;
-      vofa_buf[3] = speed_BR_mps;
+      vofa_buf[0] = filt_FL;
+      vofa_buf[1] = filt_FR;
+      vofa_buf[2] = filt_BL;
+      vofa_buf[3] = filt_BR;
       uint8_t ir_byte = 0;
       for (int i = 0; i < 8; i++) {
           if (local_sensor.ir[i]) ir_byte |= (1 << i);

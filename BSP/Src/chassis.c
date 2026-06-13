@@ -161,6 +161,19 @@ void Chassis_VOFA_Parse(const uint8_t *cmd_buf) {
         return;
     }
 
+    // F/L 命令：全局参数，不依赖 DEBUG 状态
+    if (cmd_buf[0] == 'F') {
+        extern float g_br_feedforward;
+        g_br_feedforward = atof((const char *)&cmd_buf[1]);
+        return;
+    }
+    if (cmd_buf[0] == 'L') {
+        extern float g_speed_filt_alpha;
+        float v = atof((const char *)&cmd_buf[1]);
+        if (v >= 0.0f && v <= 0.99f) g_speed_filt_alpha = v;
+        return;
+    }
+
     if (cmd_buf[0] == 'T' && g_chassis_state != STATE_DEBUG) return;
 
     float val = atof((const char *)&cmd_buf[1]);

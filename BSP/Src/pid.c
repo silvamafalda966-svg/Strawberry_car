@@ -83,15 +83,23 @@ float PID_Incremental_Calc(PID_TypeDef *pid, float actual_speed)
 
     // 增量式 PID 核心数学公式：
     // ΔU(k) = Kp*[e(k) - e(k-1)] + Ki*e(k) + Kd*[e(k) - 2e(k-1) + e(k-2)]
-    increment_val = pid->Kp * (pid->err - pid->err_last) + 
-                    pid->Ki * pid->err + 
-                    pid->Kd * (pid->err - 2.0f * pid->err_last + pid->err_prev2);
+    float p_term = pid->Kp * (pid->err - pid->err_last);
+    float i_term = pid->Ki * pid->err;
+    float d_term = pid->Kd * (pid->err - 2.0f * pid->err_last + pid->err_prev2);
+
+    // === 积分抗饱和：输出已饱和时，抑制同向积分蓄力 ===
+    if ((pid->out_PWM >= pid->max_out_PWM && i_term > 0.0f) ||
+        (pid->out_PWM <= pid->min_out_PWM && i_term < 0.0f)) {
+        i_term = 0.0f;  // 饱和方向不蓄积分，防止 windup
+    }
+
+    increment_val = p_term + i_term + d_term;
 
     // 将计算出的增量值累加到历史 PWM 输出上
     pid->out_PWM += increment_val;
 
     // 更新历史误差记录，把当下变成过去，等待下一次循环
-    pid->err_prev2 = pid->err_last; 
+    pid->err_prev2 = pid->err_last;
     pid->err_last = pid->err;
 
     // === 极限保护：PWM 输出防超限 ===
