@@ -1,49 +1,15 @@
-# STM32CubeMX / MDK-ARM generated files
-MDK-ARM/*.uvguix.*
-MDK-ARM/*.uvoptx
-MDK-ARM/*.scvd
-MDK-ARM/DebugConfig/
-MDK-ARM/Listings/
-MDK-ARM/Objects/
-MDK-ARM/RTE/
-MDK-ARM/*.admin
-MDK-ARM/*.crf
-MDK-ARM/*.d
-MDK-ARM/*.o
-MDK-ARM/*.axf
-MDK-ARM/*.hex
-MDK-ARM/*.htm
-MDK-ARM/*.lnp
-MDK-ARM/*.lst
-MDK-ARM/*.map
-MDK-ARM/*.iex
-MDK-ARM/*.sct
-MDK-ARM/*.dep
-MDK-ARM/*.build_log.htm
-MDK-ARM/*.tra
-MDK-ARM/*.uvprojx.bak
-
-# STM32CubeMX backup files
-*.ioc.bak
-*.ioc.orig
-
-# Binary and temporary files
-*.bin
-*.elf
-*.out
-*.o
-*.d
-*.crf
-*.lnp
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-Thumbs.db
-Desktop.ini
+docs/node_modules/
+__pycache__/
+*.pyc
 .DS_Store
+MDK-ARM/Strawberry_car/*.axf
+MDK-ARM/Strawberry_car/*.hex
+MDK-ARM/Strawberry_car/*.htm
+MDK-ARM/Strawberry_car/*.map
+MDK-ARM/Strawberry_car/*.dep
+MDK-ARM/Strawberry_car/*.crf
+MDK-ARM/Strawberry_car/*.d
+MDK-ARM/Strawberry_car/*.o
+MDK-ARM/RTE/
+MDK-ARM/DebugConfig/
+BSP/Src/build_exam_answers.py
