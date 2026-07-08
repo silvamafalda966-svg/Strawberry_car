@@ -18,17 +18,16 @@ int32_t            g_turn_enc        = 0;
 float              g_avg_speed_mps   = 0.0f;
 uint32_t           g_sys_tick        = 0;     // freertos.c 每周期 +1
 
-/* ── 防重触发：摘完一株后短暂抑制 ── */
-static uint32_t    g_suppress_until_tick = 0;
-
 /* ══════════════════════════════════════════════════════════════════════
    Phase 2 文件级持久状态（保持巡线+避障不变）
    ══════════════════════════════════════════════════════════════════════ */
 
+// 岔路口抑制（出岔后 3 秒内不再触发）
+static uint32_t g_suppress_until_tick = 0;
+
 // LINE_FOLLOW 持久状态
 static float    last_line_err   = 0.0f;
-static uint8_t  lf_trig_cnt    = 0;       // 触发确认计数器
-static uint8_t  lf_trig_side   = 0;       // 当前触发侧 0=none 1=left 2=right
+
 
 // OBSTACLE 持久状态
 static ObsSubStage_t ob_stage      = OB_STOP;
@@ -38,22 +37,52 @@ static int32_t       ob_mem_dist   = 0;
 static int32_t       ob_turn_start = 0;
 
 /* ══════════════════════════════════════════════════════════════════════
-   Phase 3 文件级持久状态（草莓检测链 v5）
+   Phase 2 文件级持久状态（岔路采摘）
    ══════════════════════════════════════════════════════════════════════ */
 
-// VISUAL_APPROACH 持久状态
-static float   va_y_filt        = 120.0f;   // Y 一阶低通滤波输出
-static float   va_last_x_center = 160.0f;   // 丢目标时的上帧 X_center
-static int     va_center_cnt    = 0;        // X 居中连续帧计数
-static int     va_no_target_ms  = 0;        // 丢目标累计 ms
+// 全局判定结果（供 OLED 读取）
+BranchDecision_t g_branch_decision = {0, 0, 0, 0, 0, 0};
+uint8_t          g_branch_zone     = 0;     // 区域编号递增
 
-// SCANNING 持久状态
-static int     scan_tick        = 0;
-static int     scan_max_red     = 0;
-static int     scan_max_green   = 0;
+// LINE_FOLLOW 岔路检测计数器
+static uint8_t  junction_cnt    = 0;        // 连续全黑帧计数
 
-// BREAKAWAY 转向持久状态
-static int     ba_no_target_ms  = 0;
+// BRANCH_ENTER 持久状态
+static int32_t  be_fwd_start    = 0;        // 前进补偿起始编码器
+static int32_t  be_turn_start   = 0;        // 转弯起始编码器
+static uint32_t be_turn_ticks   = 0;        // 转弯超时计数
+
+// BRANCH_FOLLOW 持久状态
+static int32_t  bf_fwd_start     = 0;       // 前进起始编码器（用于倒车距离记录）
+static int32_t  bf_rev_start     = 0;       // 倒车微调起始编码器
+static uint8_t  bf_stop_cnt      = 0;       // 超声波停车确认计数
+static uint8_t  bf_phase         = 0;       // 0=前进 1=倒车微调到36cm
+static float    bf_last_line_err = 0.0f;    // 分支线丢线保持（独立，不污染主赛道）
+
+// BRANCH_JUDGE 持久状态
+static uint32_t bj_tick         = 0;        // 判定采集计数
+static uint8_t  bj_best_red_area   = 0;     // 窗口内最大红草莓面积
+static uint8_t  bj_best_green_area = 0;     // 窗口内最大绿草莓面积
+static uint8_t  bj_red_cnt      = 0;        // 窗口内红草莓峰值
+static uint8_t  bj_green_cnt    = 0;        // 窗口内绿草莓峰值
+
+// BRANCH_REVERSE 持久状态
+static int32_t  br_rev_start    = 0;        // 倒车起始编码器
+static int32_t  br_comp_start   = 0;        // 倒车补偿起始编码器
+static uint8_t  br_junction_cnt = 0;        // 倒车时岔路检测消抖
+// Zone Demo 持久状态
+uint8_t  g_zone_active      = 0;            // 1=Zone Demo 模式中
+uint8_t  g_zone_id          = 0;            // 目标 Zone 编号 1~N
+int32_t  g_zone_target_enc  = 0;            // 目标岔路编码器值
+uint8_t  g_zone_done        = 0;            // 1=已完成判定
+
+// ZONE_RETURN 持久状态
+static int32_t  zr_turn_start    = 0;       // 180掉头起始 g_turn_enc
+static int32_t  zr_fwd_start     = 0;       // Phase2 前进15cm起始 enc
+static uint8_t  zr_phase         = 0;       // 0=掉头 1=前进 2=右转 3=倒车
+static float    zr_last_line_err = 0.0f;    // 巡线丢线保持
+static uint8_t  zr_junction_cnt  = 0;       // 岔路检测消抖
+
 
 /* ══════════════════════════════════════════════════════════════════════
    Chassis_Move API — 只设 pid_X.Target，CalcOneWheel 统一处理
@@ -116,20 +145,6 @@ static PID_TypeDef *get_wheel_pid(uint8_t idx) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
-   Servo Y-axis servo (TIM9 CH1, PA2, 50Hz)
-   deviation > 0 = target below center → tilt down
-   deviation < 0 = target above center → tilt up
-   ══════════════════════════════════════════════════════════════════════ */
-
-void Servo_Y_Servo(float y_deviation_px)
-{
-    float pulse_us = 1500.0f + y_deviation_px * 4.0f;
-    if (pulse_us > 2100.0f) pulse_us = 2100.0f;
-    if (pulse_us <  900.0f) pulse_us =  900.0f;
-    __HAL_TIM_SET_COMPARE(&htim9, TIM_CHANNEL_1, (uint16_t)pulse_us);
-}
-
-/* ══════════════════════════════════════════════════════════════════════
    VOFA+ 命令解析
    MD→DEBUG  M0→IDLE  M1→LINE_FOLLOW ... M9→FINISH
    ══════════════════════════════════════════════════════════════════════ */
@@ -140,11 +155,19 @@ void Chassis_VOFA_Parse(const uint8_t *cmd_buf) {
     if (cmd_buf[0] == '\0') return;
 
     if (cmd_buf[0] == 'M') {
+        // 手动切模式时取消 Zone Demo
+        g_zone_active = 0;
         if (cmd_buf[1] == 'D') {
             g_chassis_state = STATE_DEBUG;
         } else if (cmd_buf[1] >= '0' && cmd_buf[1] <= '9') {
-            // M0=IDLE(1), M1=LINE_FOLLOW(2), ..., M9=FINISH(10)
-            g_chassis_state = (ChassisState_t)(cmd_buf[1] - '0' + 1);
+            // M0=IDLE(1) M1=LINE_FOLLOW(2) M2=OBSTACLE(3) M3=FINISH(4) M4=BRANCH_ENTER(5) M5=BRANCH_FOLLOW(6) M6=BRANCH_JUDGE(7) M7=BRANCH_REVERSE(8) M8=ZONE_RETURN(9)
+            int m_idx = cmd_buf[1] - '0';
+            if (cmd_buf[2] >= '0' && cmd_buf[2] <= '9') {
+                m_idx = m_idx * 10 + (cmd_buf[2] - '0');
+            }
+            if (m_idx >= 0 && m_idx <= 8) {
+                g_chassis_state = (ChassisState_t)(m_idx + 1);
+            }
         }
         return;
     }
@@ -176,6 +199,30 @@ void Chassis_VOFA_Parse(const uint8_t *cmd_buf) {
 
     if (cmd_buf[0] == 'T' && g_chassis_state != STATE_DEBUG) return;
 
+    // Z: Zone Demo 命令 Z:<id>,<encoder>
+    if (cmd_buf[0] == 'Z') {
+        const char *p = (const char *)&cmd_buf[1];
+        char *end;
+        long id = strtol(p, &end, 10);
+        if (end > p && *end == ',') {
+            long enc = strtol(end + 1, NULL, 10);
+            if (id >= 1 && id <= 99 && enc > 0) {
+                Chassis_Stop();  // 先停车，再切巡线
+                g_zone_active     = 1;
+                g_zone_id         = (uint8_t)id;
+                g_zone_target_enc = (int32_t)enc;
+                g_zone_done       = 0;
+                // 🔧 Day 21 修复：清除残留抑制 + 重置消抖计数
+                //   - g_suppress_until_tick 可能被上次 BRANCH_REVERSE 设了值
+                //   - junction_cnt 清空确保从 0 开始积累
+                g_suppress_until_tick = 0;
+                junction_cnt = 0;
+                g_chassis_state   = STATE_LINE_FOLLOW;
+            }
+        }
+        return;
+    }
+
     float val = atof((const char *)&cmd_buf[1]);
 
     if (cur_wheel < 4) {
@@ -206,13 +253,13 @@ static void entry_idle(void)            { Chassis_Stop(); }
 
 static void entry_line_follow(void) {
     Chassis_MoveForward(LINE_BASE_SPEED);
-    // 排空 K210 队列（避障/倒车期间囤的旧帧）
-    extern QueueHandle_t xQueue_VisionData;
-    uint8_t dummy[24];
-    while (xQueueReceive(xQueue_VisionData, dummy, 0) == pdTRUE) {}
+
     last_line_err = 0.0f;
-    lf_trig_cnt   = 0;       // 重置触发计数器
-    lf_trig_side  = 0;
+
+    junction_cnt  = 0;       // 重置岔路检测
+    // 注意：不重置 g_suppress_until_tick！
+    // BRANCH_REVERSE→LINE_FOLLOW 需要 suppress 防止重触发同一岔路
+    // Z: 命令通过显式赋值来清零，见 Chassis_VOFA_Parse
 }
 
 static void entry_obstacle(void) {
@@ -224,39 +271,44 @@ static void entry_obstacle(void) {
     ob_turn_start = 0;
 }
 
-static void entry_green_filter(void)    { Chassis_Stop(); }
-
-/* ── BREAKAWAY: 刹车 + 准备转向 ── */
-static void entry_breakaway(void) {
-    Chassis_Stop();
-    ba_no_target_ms = 0;
-}
-
-/* ── VISUAL_APPROACH: 初始化双轴伺服 ── */
-static void entry_visual_approach(void) {
-    va_y_filt        = 120.0f;
-    va_last_x_center = 160.0f;
-    va_center_cnt    = 0;
-    va_no_target_ms  = 0;
-}
-
-/* ── SCANNING: 初始化扫描窗口 ── */
-static void entry_scanning(void) {
-    scan_tick      = 0;
-    scan_max_red   = 0;
-    scan_max_green = 0;
-}
-
-/* ── DOCKING: 汇总上报 ── */
-static void entry_docking(void) {
-    g_red_count   += scan_max_red;
-    g_green_count += scan_max_green;
-    // 设防重触发窗口
-    g_suppress_until_tick = g_sys_tick + POST_DOCK_SUPPRESS_MS / 10;
-}
-
-static void entry_blind_return(void)    { Chassis_MoveBackward(RETURN_SPEED); }
 static void entry_finish(void)          { Chassis_Stop(); }
+
+/* ── BRANCH_ENTER: 前进补偿传感器偏移 → 原地转弯 ── */
+static void entry_branch_enter(void) {
+    // Phase 0: 先慢速前进，让轮轴对齐十字标记
+    Chassis_MoveForward(0.15f);
+    be_fwd_start  = g_enc_total;
+    be_turn_start = 0;
+    be_turn_ticks = 0;
+    g_branch_zone++;                        // 进入新区域
+}
+
+/* ── BRANCH_FOLLOW: 沿分支线慢速前进，超声<36cm倒车微调 ── */
+static void entry_branch_follow(void) {
+    Chassis_MoveForward(BRANCH_FOLLOW_SPEED);
+    bf_fwd_start = g_enc_total;
+    bf_rev_start = 0;
+    bf_stop_cnt  = 0;
+    bf_phase     = 0;
+}
+
+/* ── BRANCH_JUDGE: 停车，重置采集窗口 ── */
+static void entry_branch_judge(void) {
+    Chassis_Stop();
+    bj_tick           = 0;
+    bj_best_red_area  = 0;
+    bj_best_green_area = 0;
+    bj_red_cnt        = 0;
+    bj_green_cnt      = 0;
+    memset(&g_branch_decision, 0, sizeof(g_branch_decision));
+}
+
+/* ── BRANCH_REVERSE: 直线倒车 ── */
+static void entry_branch_reverse(void) {
+    Chassis_MoveBackward(BRANCH_REVERSE_SPEED);
+    br_rev_start    = g_enc_total;
+    br_junction_cnt = 0;
+}
 
 /* ══════════════════════════════════════════════════════════════════════
    Run 函数 — 每周期调用，返回下一状态（或同状态继续）
@@ -282,15 +334,18 @@ static ChassisState_t run_line_follow(const SensorData_t *s,
     /* ── 1. 红外位置计算（加权平均） ── */
     float ir_sum   = 0.0f;
     int   black_cnt = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < IR_SENSOR_COUNT; i++) {
         if (s->ir[i] == 0) { ir_sum += (float)i; black_cnt++; }
     }
 
     float line_err;
     if (black_cnt > 0) {
-        line_err = ir_sum / (float)black_cnt - 3.5f;
+        line_err = ir_sum / (float)black_cnt - IR_CENTER_OFFSET;
         last_line_err = line_err;
     } else {
+        // 丢线时衰减 last_line_err，防止永久转圈
+        // 0.95^100 ≈ 0.006，约 1 秒后趋近直行
+        last_line_err *= 0.95f;
         line_err = last_line_err;
     }
 
@@ -303,32 +358,29 @@ static ChassisState_t run_line_follow(const SensorData_t *s,
     Chassis_DiffTurn(speed, turn_corr);
 #endif
 
-    /* ── 3. v5 侧边触发检测 ── */
-    // 防重触发检查
+    /* ── 3. 岔路口检测（6路全黑 = 十字标记，出岔后抑制期内不触发） ── */
     if (g_sys_tick < g_suppress_until_tick) {
-        return STATE_LINE_FOLLOW;
-    }
-
-    if (hv && v != NULL && v->count > 0) {
-        uint8_t cur_side = 0;
-        for (int i = 0; i < v->count; i++) {
-            if (v->t[i].cls == 0 || v->t[i].cls == 1) {  // 任何草莓
-                if (v->t[i].x < PLANT_X_LEFT)  cur_side = 1;  // 左
-                if (v->t[i].x > PLANT_X_RIGHT) cur_side = 2;  // 右
+        junction_cnt = 0;  // 抑制期内清零
+    } else if (black_cnt >= IR_SENSOR_COUNT) {
+        junction_cnt++;
+        if (junction_cnt >= JUNCTION_CONFIRM_FRAMES) {
+            junction_cnt = 0;
+            // Zone Demo 模式：只匹配目标岔路
+            if (g_zone_active) {
+                int32_t diff = g_enc_total - g_zone_target_enc;
+                if (diff < 0) diff = -diff;
+                if (diff < ZONE_ENC_TOLERANCE) {
+                    return STATE_BRANCH_ENTER;  // 匹配！拐入
+                }
+                // 不匹配 → 短抑制 500ms（50tick），只够越过胶带宽度
+                // 用 500ms 而非 3s：避免误伤后续的目标岔路
+                g_suppress_until_tick = g_sys_tick + 50;  // 500ms @ 100Hz
+            } else {
+                return STATE_BRANCH_ENTER;  // 普通模式：任何岔路都拐
             }
         }
-
-        if (cur_side != 0 && cur_side == lf_trig_side) {
-            lf_trig_cnt++;
-            if (lf_trig_cnt >= TRIGGER_CONFIRM) {
-                lf_trig_cnt  = 0;
-                lf_trig_side = 0;
-                return STATE_BREAKAWAY;
-            }
-        } else {
-            lf_trig_cnt  = (cur_side != 0) ? 1 : 0;
-            lf_trig_side = cur_side;
-        }
+    } else {
+        junction_cnt = 0;
     }
 
     return STATE_LINE_FOLLOW;
@@ -451,7 +503,7 @@ static ChassisState_t run_obstacle(const SensorData_t *s,
         Chassis_MoveForward(OB_FWD_SPEED);
         ob_ticks++;
         black_cnt = 0;
-        for (int i = 0; i < 8; i++) if (s->ir[i] == 0) black_cnt++;
+        for (int i = 0; i < IR_SENSOR_COUNT; i++) if (s->ir[i] == 0) black_cnt++;
         dist_traveled = g_enc_total - ob_start_enc;
         if (black_cnt >= 2 || dist_traveled >= (int32_t)(OB_FWD_TO_LINE_CM * ENC_PER_CM)) {
             ob_stage = OB_DONE;
@@ -467,248 +519,375 @@ static ChassisState_t run_obstacle(const SensorData_t *s,
     return STATE_OBSTACLE;
 }
 
-/* ── 4. GREEN_FILTER [STUB] ── */
-static ChassisState_t run_green_filter(const SensorData_t *s,
-                                        uint8_t hv, const VisionFrame_t *v) {
-    (void)s; (void)hv; (void)v;
-    return STATE_GREEN_FILTER;
-}
 
-/* ── 5. BREAKAWAY — X 轴视觉伺服原地转向 ── */
-static ChassisState_t run_breakaway(const SensorData_t *s,
-                                     uint8_t hv, const VisionFrame_t *v) {
-    (void)s;
-
-    if (hv && v != NULL && v->count > 0) {
-        ba_no_target_ms = 0;
-
-        // 计算植株水平中心
-        uint8_t min_x = 255, max_x = 0;
-        for (int i = 0; i < v->count; i++) {
-            if (v->t[i].cls <= 1) {  // 有效目标
-                if (v->t[i].x < min_x) min_x = v->t[i].x;
-                if (v->t[i].x > max_x) max_x = v->t[i].x;
-            }
-        }
-        float x_center = (min_x + max_x) / 2.0f;
-        float dev = x_center - X_CENTER_PX;
-
-        if (dev < -X_DEADBAND_PX) {
-            Chassis_TurnInPlace(TURN_SERVO_SPEED, -1);  // CCW (植株偏左)
-        } else if (dev > X_DEADBAND_PX) {
-            Chassis_TurnInPlace(TURN_SERVO_SPEED, 1);   // CW  (植株偏右)
-        } else {
-            Chassis_Stop();
-            return STATE_VISUAL_APPROACH;  // 已对中 → 前进
-        }
-    } else {
-        // 丢目标：累计超时
-        ba_no_target_ms += 10;
-        if (ba_no_target_ms >= 1000) {
-            Chassis_Stop();
-            return STATE_BLIND_RETURN;  // 1s 无目标 → 退回
-        }
-        // 保持慢转，期望重新捕获
-        Chassis_TurnInPlace(TURN_SERVO_SPEED, 1);
-    }
-
-    return STATE_BREAKAWAY;
-}
-
-/* ── 6. VISUAL_APPROACH — 双轴伺服前进 + 全景停车 ── */
-static ChassisState_t run_visual_approach(const SensorData_t *s,
-                                           uint8_t hv, const VisionFrame_t *v) {
-    (void)s;
-
-    if (hv && v != NULL && v->count > 0) {
-        va_no_target_ms = 0;
-
-        // 计算植株边界
-        uint8_t min_x = 255, max_x = 0;
-        uint8_t min_y = 240, max_y = 0;
-        uint8_t max_area = 0;
-        for (int i = 0; i < v->count; i++) {
-            if (v->t[i].cls <= 1) {
-                if (v->t[i].x < min_x) min_x = v->t[i].x;
-                if (v->t[i].x > max_x) max_x = v->t[i].x;
-                if (v->t[i].y < min_y) min_y = v->t[i].y;
-                if (v->t[i].y > max_y) max_y = v->t[i].y;
-                if (v->t[i].area > max_area) max_area = v->t[i].area;
-            }
-        }
-
-        /* ── X 轴伺服（差速转向） ── */
-        float x_center = (min_x + max_x) / 2.0f;
-        va_last_x_center = x_center;
-        float x_dev = x_center - X_CENTER_PX;
-
-        /* ── Y 轴伺服（低通滤波 + 死区） ── */
-        float y_center_raw = (min_y + max_y) / 2.0f;
-        va_y_filt = va_y_filt * (1.0f - Y_FILT_NEW) + y_center_raw * Y_FILT_NEW;
-        float y_dev = va_y_filt - Y_CENTER_PX;
-
-        if (y_dev < -Y_DEADBAND_PX || y_dev > Y_DEADBAND_PX) {
-            Servo_Y_Servo(y_dev);  // Outside deadband → adjust
-        }
-        // Inside deadband → servo stays
-
-        /* ── 速度递减 ── */
-        float range = (float)(APPROACH_AREA_STOP);
-        float frac  = (float)max_area / range;
-        if (frac > 1.0f) frac = 1.0f;
-        float speed = APPROACH_BASE_SPEED - (APPROACH_BASE_SPEED - APPROACH_MIN_SPEED) * frac;
-
-        /* ── X 轴 P 控制器 → DiffTurn ── */
-        float turn_kp = 0.02f;
-        Chassis_DiffTurn(speed, x_dev * turn_kp);
-
-        /* ── 全景停车判定 ── */
-        if (max_area >= APPROACH_AREA_STOP) {
-            float abs_dev = (x_dev > 0) ? x_dev : -x_dev;
-            if (abs_dev < X_DEADBAND_PX) {
-                va_center_cnt++;
-            } else {
-                va_center_cnt = 0;
-            }
-            if (va_center_cnt >= APPROACH_CENTER_OK) {
-                Chassis_Stop();
-                return STATE_SCANNING;
-            }
-        } else {
-            va_center_cnt = 0;
-        }
-
-    } else {
-        // 丢目标
-        va_no_target_ms += 10;
-        if (va_no_target_ms > 200) {
-            Chassis_Stop();
-            return STATE_BLIND_RETURN;  // >200ms → 退回
-        }
-        // ≤200ms: 保持上帧方向继续
-        float turn_kp = 0.02f;
-        Chassis_DiffTurn(APPROACH_MIN_SPEED, (va_last_x_center - X_CENTER_PX) * turn_kp);
-    }
-
-    return STATE_VISUAL_APPROACH;
-}
-
-/* ── 7. SCANNING — 固定窗口取单帧最高纪录 ── */
-static ChassisState_t run_scanning(const SensorData_t *s,
-                                    uint8_t hv, const VisionFrame_t *v) {
-    (void)s;
-
-    if (hv && v != NULL && v->count > 0) {
-        int cur_red = 0, cur_green = 0;
-        for (int i = 0; i < v->count; i++) {
-            if (v->t[i].cls == 1) cur_red++;
-            if (v->t[i].cls == 0) cur_green++;
-        }
-        if (cur_red   > scan_max_red)   scan_max_red   = cur_red;
-        if (cur_green > scan_max_green) scan_max_green = cur_green;
-    }
-
-    scan_tick++;
-    if (scan_tick >= SCAN_FRAMES) {
-        return STATE_DOCKING;
-    }
-
-    return STATE_SCANNING;
-}
-
-/* ── 8. DOCKING — 蜂鸣上报 ── */
-static ChassisState_t run_docking(const SensorData_t *s,
-                                   uint8_t hv, const VisionFrame_t *v) {
-    (void)s; (void)hv; (void)v;
-
-    // 蜂鸣：0~2000ms 长响，2000~2400ms 两短声
-    uint32_t t = g_state_ticks * 10;  // ms
-    if (t < 2000) {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);  // 长响
-    } else if (t < 2080) {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET); // 第一短声间隔
-    } else if (t < 2160) {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);   // 第一短声
-    } else if (t < 2240) {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET); // 间隔
-    } else if (t < 2320) {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);   // 第二短声
-    } else {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
-    }
-
-    if (g_state_ticks >= 250) {  // 2.5s @ 100Hz
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
-        return STATE_BLIND_RETURN;
-    }
-    return STATE_DOCKING;
-}
-
-/* ── 9. BLIND_RETURN — 倒车回线 ── */
-static ChassisState_t run_blind_return(const SensorData_t *s,
-                                        uint8_t hv, const VisionFrame_t *v) {
-    (void)hv; (void)v;
-
-    /* ── 阶段 0：倒车 ── */
-    static uint8_t br_phase = 0;  // 0=倒车, 1=自旋找线
-    static int32_t  br_start_enc = 0;
-    static uint32_t br_spin_ticks = 0;
-
-    if (g_state_ticks == 0) {
-        br_phase = 0;
-        br_start_enc = 0;
-        br_spin_ticks = 0;
-    }
-
-    if (br_phase == 0) {
-        if (br_start_enc == 0) br_start_enc = g_enc_total;
-        Chassis_MoveBackward(RETURN_SPEED);
-
-        // 倒车过程中也检查红外：如果退到线上了直接开始找线
-        int bc = 0;
-        for (int i = 0; i < 8; i++) if (s->ir[i] == 0) bc++;
-
-        // 退了 40cm 或发现黑线 → 进入自旋找线阶段
-        int32_t backed = br_start_enc - g_enc_total;
-        if (backed >= (int32_t)(40.0f * ENC_PER_CM) || bc >= 2) {
-            Chassis_Stop();
-            br_phase = 1;
-            br_spin_ticks = 0;
-        }
-    } else {
-        // 阶段 1：自旋找线
-        Chassis_TurnInPlace(RETURN_SPIN_SPEED, 1);  // CW 自旋
-        br_spin_ticks++;
-
-        int bc = 0;
-        for (int i = 0; i < 8; i++) if (s->ir[i] == 0) bc++;
-
-        if (bc >= 2) {
-            Chassis_Stop();
-            br_phase = 0;
-            return STATE_LINE_FOLLOW;
-        }
-
-        // 兜底：自旋超过 3s 还没找到线 → 放弃，直接切 LINE_FOLLOW
-        if (br_spin_ticks >= 300) {
-            Chassis_Stop();
-            br_phase = 0;
-            return STATE_LINE_FOLLOW;
-        }
-    }
-
-    return STATE_BLIND_RETURN;
-}
-
-/* ── 10. FINISH [STUB] ── */
+/* ── 4. FINISH [STUB] ── */
 static ChassisState_t run_finish(const SensorData_t *s,
                                   uint8_t hv, const VisionFrame_t *v) {
     (void)s; (void)hv; (void)v;
     return STATE_FINISH;
 }
 
+/* ── 5. BRANCH_ENTER — 前进补偿 → 原地转弯 90° 进入分支线 ── */
+static ChassisState_t run_branch_enter(const SensorData_t *s,
+                                        uint8_t hv, const VisionFrame_t *v) {
+    (void)s; (void)hv; (void)v;
+
+    // Phase 0: 前进补偿传感器→轮轴偏移距离
+    if (be_turn_start == 0) {
+        int32_t fwd_dist = g_enc_total - be_fwd_start;
+        if (fwd_dist < (int32_t)(BRANCH_FWD_BEFORE_TURN_CM * ENC_PER_CM)) {
+            return STATE_BRANCH_ENTER;  // 还没走够，继续前进
+        }
+        // 到位，开始转弯
+        be_turn_start = g_turn_enc;
+        Chassis_TurnInPlace(OB_TURN_SPEED, JUNCTION_SIDE);
+    }
+
+    // Phase 1: 原地转弯 90°
+    be_turn_ticks++;
+
+    if ((g_turn_enc - be_turn_start) >= TURN90_TOTAL_ENC
+        || be_turn_ticks >= (OB_TURN_MS / 10)) {
+        Chassis_Stop();
+        return STATE_BRANCH_FOLLOW;
+    }
+
+    return STATE_BRANCH_ENTER;
+}
+
+/* ── 6. BRANCH_FOLLOW — 沿分支线慢速巡线，超声<36cm倒车微调到36cm ── */
+static ChassisState_t run_branch_follow(const SensorData_t *s,
+                                         uint8_t hv, const VisionFrame_t *v) {
+    (void)hv; (void)v;
+
+    // Phase 0: 沿分支线前进直到超声 < 36cm
+    if (bf_phase == 0) {
+        float ir_sum = 0.0f;
+        int   black_cnt = 0;
+        for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+            if (s->ir[i] == 0) { ir_sum += (float)i; black_cnt++; }
+        }
+
+        float line_err;
+        if (black_cnt > 0) {
+            line_err = ir_sum / (float)black_cnt - IR_CENTER_OFFSET;
+            bf_last_line_err = line_err;
+        } else {
+            bf_last_line_err *= 0.95f;
+            line_err = bf_last_line_err;
+        }
+        float turn_corr = line_err * BRANCH_LINE_KP;
+        float speed = (black_cnt == 0) ? 0.10f : BRANCH_FOLLOW_SPEED;
+        Chassis_DiffTurn(speed, turn_corr);
+
+        if (s->distance_cm < BRANCH_STOP_DIST_CM) {
+            bf_stop_cnt++;
+            if (bf_stop_cnt >= BRANCH_STOP_CONFIRM) {
+                Chassis_Stop();
+                bf_rev_start = g_enc_total;
+                bf_phase = 1;
+            }
+        } else {
+            bf_stop_cnt = 0;
+        }
+
+        int32_t fwd_dist = g_enc_total - bf_fwd_start;
+        if (fwd_dist >= (int32_t)(BRANCH_REVERSE_MAX_CM * ENC_PER_CM)) {
+            Chassis_Stop();
+            return STATE_BRANCH_REVERSE;
+        }
+    }
+    // Phase 1: 倒车微调，直到超声距离回到 36cm
+    else {
+        Chassis_MoveBackward(0.10f);
+        if (s->distance_cm >= BRANCH_STOP_DIST_CM) {
+            bf_stop_cnt++;
+            if (bf_stop_cnt >= BRANCH_STOP_CONFIRM) {
+                bf_stop_cnt = 0;
+                bf_phase = 0;
+                Chassis_Stop();
+                return STATE_BRANCH_JUDGE;
+            }
+        } else {
+            bf_stop_cnt = 0;
+        }
+
+        // 安全超时：倒车距离不超过前进距离
+        int32_t rev_dist = bf_rev_start - g_enc_total;
+        if (rev_dist >= (int32_t)(BRANCH_REVERSE_MAX_CM * ENC_PER_CM)) {
+            Chassis_Stop();
+            bf_phase = 0;
+            return STATE_BRANCH_JUDGE;  // 超时也判定，不浪费这次岔路
+        }
+    }
+
+    return STATE_BRANCH_FOLLOW;
+}
+
+/* ── 7. BRANCH_JUDGE — 停车采集 K210 数据，多目标排序决策 ── */
+static ChassisState_t run_branch_judge(const SensorData_t *s,
+                                        uint8_t hv, const VisionFrame_t *v) {
+    (void)s;
+
+    if (hv && v != NULL && v->count > 0) {
+        for (int i = 0; i < v->count; i++) {
+            uint8_t cls  = v->t[i].cls;
+            uint8_t area = v->t[i].area;
+
+            if (area < BRANCH_AREA_MIN) continue;
+
+            if (cls == 0) {
+                bj_red_cnt++;
+                if (area > bj_best_red_area) bj_best_red_area = area;
+            } else if (cls == 1) {
+                bj_green_cnt++;
+                if (area > bj_best_green_area) bj_best_green_area = area;
+            }
+        }
+    }
+
+    bj_tick++;
+
+    if (bj_tick >= BRANCH_JUDGE_TICKS) {
+        g_branch_decision.total_red   = (bj_red_cnt > 255) ? 255 : (uint8_t)bj_red_cnt;
+        g_branch_decision.total_green = (bj_green_cnt > 255) ? 255 : (uint8_t)bj_green_cnt;
+
+        if (bj_best_red_area >= BRANCH_AREA_MIN) {
+            g_branch_decision.detected = 1;
+            g_branch_decision.cls      = 0;
+            g_branch_decision.area     = bj_best_red_area;
+            g_branch_decision.pick     = 1;
+        } else if (bj_best_green_area >= BRANCH_AREA_MIN) {
+            g_branch_decision.detected = 1;
+            g_branch_decision.cls      = 1;
+            g_branch_decision.area     = bj_best_green_area;
+            g_branch_decision.pick     = 0;
+        } else {
+            g_branch_decision.detected = 0;
+            g_branch_decision.pick     = 0;
+        }
+
+        if (g_branch_decision.pick) {
+            g_red_count++;
+        } else if (g_branch_decision.detected && g_branch_decision.cls == 1) {
+            g_green_count++;
+        }
+
+        return STATE_BRANCH_REVERSE;
+    }
+
+    return STATE_BRANCH_JUDGE;
+}
+
+/* ── 8. BRANCH_REVERSE — 直线倒车返回主赛道 ── */
+static ChassisState_t run_branch_reverse(const SensorData_t *s,
+                                          uint8_t hv, const VisionFrame_t *v) {
+    (void)hv; (void)v;
+
+    static uint8_t  br_phase      = 0;
+    static int32_t  br_turn_start = 0;
+    static uint32_t br_turn_ticks = 0;
+
+    if (g_state_ticks == 0) {
+        br_phase      = 0;
+        br_comp_start = 0;
+        br_turn_start = 0;
+        br_turn_ticks = 0;
+    }
+
+    // Phase 0: 倒车 → 检测十字标记
+    if (br_phase == 0) {
+        int black_cnt = 0;
+        for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+            if (s->ir[i] == 0) black_cnt++;
+        }
+
+        if (black_cnt >= IR_SENSOR_COUNT) {
+            br_junction_cnt++;
+            if (br_junction_cnt >= JUNCTION_CONFIRM_FRAMES) {
+                // 检测到十字 → 刹车 → 进入前进补偿阶段
+                Chassis_Stop();
+                br_comp_start = g_enc_total;
+                br_phase = 1;
+                br_junction_cnt = 0;
+            }
+        } else {
+            br_junction_cnt = 0;
+        }
+
+        int32_t rev_dist = br_rev_start - g_enc_total;
+        if (rev_dist >= (int32_t)(BRANCH_REVERSE_MAX_CM * ENC_PER_CM)) {
+            Chassis_Stop();
+            g_suppress_until_tick = g_sys_tick + JUNCTION_SUPPRESS_MS / 10;
+            junction_cnt = 0;
+            br_junction_cnt = 0;
+            br_phase = 0;
+            if (g_zone_active) {
+                return STATE_ZONE_RETURN;
+            }
+            return STATE_LINE_FOLLOW;
+        }
+    }
+    // Phase 1: 前进 13cm，把几何中心拉回十字
+    else if (br_phase == 1) {
+        Chassis_MoveForward(0.15f);  // 每帧调用，实际只在首帧生效
+        int32_t comp_dist = g_enc_total - br_comp_start;
+        if (comp_dist >= (int32_t)(BRANCH_FWD_BEFORE_TURN_CM * ENC_PER_CM)) {
+            Chassis_Stop();
+            br_phase = 2;
+            br_turn_start = g_turn_enc;
+            br_turn_ticks = 0;
+        }
+    }
+    // Phase 2: 原地转弯 90° 回正
+    else {
+        Chassis_TurnInPlace(OB_TURN_SPEED, -JUNCTION_SIDE);
+        br_turn_ticks++;
+
+        if ((g_turn_enc - br_turn_start) >= TURN90_TOTAL_ENC
+            || br_turn_ticks >= (OB_TURN_MS / 10)) {
+            Chassis_Stop();
+            g_suppress_until_tick = g_sys_tick + JUNCTION_SUPPRESS_MS / 10;
+            junction_cnt = 0;
+            br_junction_cnt = 0;
+            br_phase = 0;
+            if (g_zone_active) {
+                return STATE_ZONE_RETURN;
+            }
+            return STATE_LINE_FOLLOW;
+        }
+    }
+
+    return STATE_BRANCH_REVERSE;
+}
+
+
+
+/* ── 9. ZONE_RETURN: 掉头180→前进到岔路→右转15cm→倒车回START ── */
+static void entry_zone_return(void) {
+    Chassis_Stop();
+    zr_phase        = 0;
+    zr_turn_start   = 0;
+    zr_fwd_start    = 0;
+    zr_junction_cnt = 0;
+    zr_last_line_err = 0.0f;
+}
+
+static ChassisState_t run_zone_return(const SensorData_t *s,
+                                       uint8_t hv, const VisionFrame_t *v) {
+    (void)hv; (void)v;
+
+    /* Phase 0: 原地180度右转，车头从朝草莓转成朝主赛道 */
+    if (zr_phase == 0) {
+        if (zr_turn_start == 0) {
+            zr_turn_start = g_turn_enc;
+            Chassis_TurnInPlace(OB_TURN_SPEED, JUNCTION_SIDE);
+        }
+        if ((g_turn_enc - zr_turn_start) >= TURN180_TOTAL_ENC) {
+            Chassis_Stop();
+            zr_phase = 1;
+        }
+        return STATE_ZONE_RETURN;
+    }
+
+    /* Phase 1: 沿分支线前进，回到主赛道岔路口 */
+    if (zr_phase == 1) {
+        float ir_sum = 0.0f;
+        int   black_cnt = 0;
+        for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+            if (s->ir[i] == 0) { ir_sum += (float)i; black_cnt++; }
+        }
+
+        float line_err;
+        if (black_cnt > 0) {
+            line_err = ir_sum / (float)black_cnt - IR_CENTER_OFFSET;
+            zr_last_line_err = line_err;
+        } else {
+            zr_last_line_err *= 0.95f;
+            line_err = zr_last_line_err;
+        }
+        float turn_corr = line_err * BRANCH_LINE_KP;
+        float speed = (black_cnt == 0) ? 0.10f : BRANCH_FOLLOW_SPEED;
+        Chassis_DiffTurn(speed, turn_corr);
+
+        if (black_cnt >= IR_SENSOR_COUNT) {
+            zr_junction_cnt++;
+            if (zr_junction_cnt >= JUNCTION_CONFIRM_FRAMES) {
+                zr_junction_cnt = 0;
+                Chassis_Stop();
+                zr_phase = 2;
+                zr_turn_start = 0;
+                zr_fwd_start  = 0;
+            }
+        } else {
+            zr_junction_cnt = 0;
+        }
+        // 超时保护（10秒未到达岔路口）
+        if (g_state_ticks > 1000) {
+            Chassis_Stop();
+            g_zone_active = 0;
+            g_zone_done   = 1;
+            return STATE_IDLE;
+        }
+        return STATE_ZONE_RETURN;
+    }
+
+    /* Phase 2: 右转90度 + 前进15cm，车头朝终点 */
+    if (zr_phase == 2) {
+        if (zr_turn_start == 0) {
+            zr_turn_start = g_turn_enc;
+            Chassis_TurnInPlace(OB_TURN_SPEED, JUNCTION_SIDE);
+        } else if ((g_turn_enc - zr_turn_start) >= TURN90_TOTAL_ENC) {
+            if (zr_fwd_start == 0) {
+                zr_fwd_start = g_enc_total;
+                Chassis_MoveForward(0.15f);
+            } else if ((g_enc_total - zr_fwd_start) >= (int32_t)(15 * ENC_PER_CM)) {
+                Chassis_Stop();
+                zr_phase = 3;
+            }
+        }
+        return STATE_ZONE_RETURN;
+    }
+
+    /* Phase 3: IR巡线倒车回START，停车: 4路全黑 AND enc<500 */
+    int black_cnt = 0;
+    float ir_sum = 0.0f;
+    for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+        if (s->ir[i] == 0) { ir_sum += (float)i; black_cnt++; }
+    }
+
+    if (black_cnt == 4 && g_enc_total < ZONE_START_ENC_THRESHOLD) {
+        Chassis_Stop();
+        g_zone_active = 0;
+        g_zone_done   = 1;
+        return STATE_IDLE;
+    }
+
+    // 超时保护（30秒未到 START 则强制停车）
+    if (g_state_ticks > (ZONE_RETURN_MAX_MS / 10)) {
+        Chassis_Stop();
+        g_zone_active = 0;
+        g_zone_done   = 1;
+        return STATE_IDLE;
+    }
+
+    float line_err;
+    if (black_cnt > 0) {
+        line_err = ir_sum / (float)black_cnt - IR_CENTER_OFFSET;
+        zr_last_line_err = line_err;
+    } else {
+        zr_last_line_err *= 0.95f;
+        line_err = zr_last_line_err;
+    }
+    float turn_corr = line_err * LINE_KP;
+    float speed = (black_cnt == 0) ? 0.08f : ZONE_RETURN_SPEED;
+    Chassis_DiffTurn(-speed, -turn_corr);
+
+    return STATE_ZONE_RETURN;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
-   状态描述符表（STATE_SCANNING 已插入）
+   状态描述符表（15 状态，含 Phase 4 岔路采摘）
    ══════════════════════════════════════════════════════════════════════ */
 
 static const StateDescriptor_t state_table[STATE_COUNT] = {
@@ -716,13 +895,12 @@ static const StateDescriptor_t state_table[STATE_COUNT] = {
     [STATE_IDLE]            = { "IDLE",            entry_idle,            run_idle,            0 },
     [STATE_LINE_FOLLOW]     = { "LINE_FOLLOW",     entry_line_follow,     run_line_follow,     0 },
     [STATE_OBSTACLE]        = { "OBSTACLE",        entry_obstacle,        run_obstacle,        0 },
-    [STATE_GREEN_FILTER]    = { "GREEN_FILTER",    entry_green_filter,    run_green_filter,    0 },
-    [STATE_BREAKAWAY]       = { "BREAKAWAY",       entry_breakaway,       run_breakaway,       0 },
-    [STATE_VISUAL_APPROACH] = { "VISUAL_APPROACH", entry_visual_approach, run_visual_approach, 0 },
-    [STATE_SCANNING]        = { "SCANNING",        entry_scanning,        run_scanning,        0 },
-    [STATE_DOCKING]         = { "DOCKING",         entry_docking,         run_docking,         0 },
-    [STATE_BLIND_RETURN]    = { "BLIND_RETURN",    entry_blind_return,    run_blind_return,    0 },
     [STATE_FINISH]          = { "FINISH",          entry_finish,          run_finish,          0 },
+    [STATE_BRANCH_ENTER]    = { "BRANCH_ENTER",    entry_branch_enter,    run_branch_enter,    0 },
+    [STATE_BRANCH_FOLLOW]   = { "BRANCH_FOLLOW",   entry_branch_follow,   run_branch_follow,   0 },
+    [STATE_BRANCH_JUDGE]    = { "BRANCH_JUDGE",    entry_branch_judge,    run_branch_judge,    0 },
+    [STATE_BRANCH_REVERSE]  = { "BRANCH_REVERSE",  entry_branch_reverse,  run_branch_reverse,  0 },
+    [STATE_ZONE_RETURN]    = { "ZONE_RETURN",    entry_zone_return,    run_zone_return,      0 },
 };
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -745,7 +923,12 @@ void Chassis_Init(void) {
     g_red_count           = 0;
     g_green_count         = 0;
     g_enc_total           = 0;
-    g_suppress_until_tick = 0;
+    g_branch_zone         = 0;
+    memset(&g_branch_decision, 0, sizeof(g_branch_decision));
+    g_zone_active         = 0;
+    g_zone_id             = 0;
+    g_zone_target_enc     = 0;
+    g_zone_done           = 0;
 }
 
 /* ══════════════════════════════════════════════════════════════════════

@@ -32,6 +32,7 @@
 #include "oled.h"
 #include "oledfont.h"
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 /* USER CODE END Includes */
@@ -57,11 +58,12 @@ uint8_t rx_buf[32];
 uint8_t rx_index = 0;
 volatile uint8_t rx_flag = 0;
 uint8_t rx_byte;
+uint8_t rx_byte_bt;  // 蓝牙 UART4 接收字节
 // K210 DMA 定长 24B 接收缓冲区
 uint8_t  k210_dma_buf[24];
 volatile uint8_t k210_frame_ready = 0;  // IDLE 中断置位，PID任务消费
 // 传感器数据（Task_Sensor 写，Task_PID_Ctrl 读）
-static SensorData_t g_sensor_data = {{0}, 300.0f};
+static SensorData_t g_sensor_data = {{1,1,1,1,1,1,1,1}, 300.0f};
 /* USER CODE END Variables */
 osThreadId Task_PID_CtrlHandle;
 osThreadId Task_VisionHandle;
@@ -213,9 +215,10 @@ void StartTaskChassis(void const * argument)
   // BR: score=26, rise=107ms, over=1.4%, plateau=95ms (mechanical friction dead zone)
   pid_BR.direction = 1; pid_BR.Kp = 0.35f; pid_BR.Ki = 0.08f; pid_BR.Kd = 0.10f; pid_BR.Target = 0.0f;
 
-  // 2. 启动 USART1 VOFA+ 中断
+  // 2. 引用 USART1/UART4/UART5 句柄（中断已在 main.c 启动）
   extern UART_HandleTypeDef huart1;
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  extern UART_HandleTypeDef huart4;
+  extern UART_HandleTypeDef huart5;
 
   // 3. 状态机初始化
   Chassis_Init();
@@ -232,7 +235,7 @@ void StartTaskChassis(void const * argument)
       }
 
       // ── B. 编码器采集（四路独立） ──
-      short dFL = (short)__HAL_TIM_GET_COUNTER(&htim5);
+      short dFL = -(short)__HAL_TIM_GET_COUNTER(&htim5);
       __HAL_TIM_SET_COUNTER(&htim5, 0);
       speed_FL_mps = (float)dFL * 0.0003694f;
 
@@ -267,9 +270,7 @@ void StartTaskChassis(void const * argument)
       memset(&vis_frame, 0, sizeof(vis_frame));
       uint8_t has_vision = 0;
       if (g_chassis_state == STATE_LINE_FOLLOW ||
-          g_chassis_state == STATE_BREAKAWAY ||
-          g_chassis_state == STATE_VISUAL_APPROACH ||
-          g_chassis_state == STATE_SCANNING) {
+              g_chassis_state == STATE_BRANCH_JUDGE) {
           uint8_t raw[24];
           if (xQueueReceive(xQueue_VisionData, raw, 0) == pdTRUE) {
               // 解析定长 24B 帧 → VisionFrame_t
@@ -324,9 +325,77 @@ void StartTaskChassis(void const * argument)
       }
 
       // ── F. 状态机运行 ──
+      static ChassisState_t prev_chassis_state = STATE_COUNT;
       Chassis_StateMachine_Run(&local_sensor, has_vision, &vis_frame,
                                (int32_t)dFL, (int32_t)dFR,
                                (int32_t)dBL, (int32_t)dBR);
+
+      // ── F2. K210 决策文本行上报（BRANCH_JUDGE → BRANCH_REVERSE 时触发一次） ──
+      if (prev_chassis_state == STATE_BRANCH_JUDGE
+          && g_chassis_state == STATE_BRANCH_REVERSE) {
+          char d_line[32];
+          int len = snprintf(d_line, sizeof(d_line),
+                             "D:%d,%d,%d,%d,%d\n",
+                             g_branch_decision.pick,
+                             g_branch_decision.cls,
+                             g_branch_decision.area,
+                             g_branch_decision.total_red,
+                             g_branch_decision.total_green);
+          if (len > 0 && len < (int)sizeof(d_line)) {
+              if (huart5.gState == HAL_UART_STATE_READY) {
+                  HAL_UART_Transmit(&huart5, (uint8_t*)d_line, len, 2);
+              }
+              HAL_UART_Transmit(&huart1, (uint8_t*)d_line, len, 10);
+          }
+      }
+
+      // ── 区域完成累计统计（BRANCH_REVERSE → LINE_FOLLOW 时上报） ──
+      if (prev_chassis_state == STATE_BRANCH_REVERSE
+          && (g_chassis_state == STATE_LINE_FOLLOW
+              || g_chassis_state == STATE_ZONE_RETURN)) {
+          char c_line[24];
+          int clen = snprintf(c_line, sizeof(c_line),
+                              "C:%d,%d,%d\n",
+                              g_branch_zone,
+                              g_red_count,
+                              g_green_count);
+          if (clen > 0 && clen < (int)sizeof(c_line)) {
+              if (huart5.gState == HAL_UART_STATE_READY) {
+                  HAL_UART_Transmit(&huart5, (uint8_t*)c_line, clen, 2);
+              }
+              HAL_UART_Transmit(&huart1, (uint8_t*)c_line, clen, 10);
+          }
+      }
+      prev_chassis_state = g_chassis_state;
+
+      // ── F3. 位置标记检测（3~4路IR黑 = 横向胶带，6路全黑 = 岔路口） ──
+      {
+          static uint8_t  marker_cnt     = 0;
+          static uint32_t marker_cooldown = 0;
+          int mk_black = 0;
+          for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+              if (local_sensor.ir[i] == 0) mk_black++;
+          }
+
+          if (mk_black == 3 || mk_black == 4) {
+              marker_cnt++;
+              if (marker_cnt >= 3 && marker_cooldown == 0) {
+                  char k_line[16];
+                  int klen = snprintf(k_line, sizeof(k_line), "K:%d\n", (int)g_enc_total);
+                  if (klen > 0 && klen < (int)sizeof(k_line)) {
+                      if (huart5.gState == HAL_UART_STATE_READY) {
+                          HAL_UART_Transmit(&huart5, (uint8_t*)k_line, klen, 2);
+                      }
+                      HAL_UART_Transmit(&huart1, (uint8_t*)k_line, klen, 10);
+                  }
+                  marker_cnt = 0;
+                  marker_cooldown = 50;  // 500ms 冷却，防重复触发
+              }
+          } else {
+              marker_cnt = 0;
+          }
+          if (marker_cooldown > 0) marker_cooldown--;
+      }
 
       // ── G. PID 计算 + 电机下发（四轮统一，使用滤波速度） ──
       float pwm_FL = CalcOneWheel(&pid_FL, filt_FL);
@@ -353,14 +422,33 @@ void StartTaskChassis(void const * argument)
       vofa_buf[2] = filt_BL;
       vofa_buf[3] = filt_BR;
       uint8_t ir_byte = 0;
-      for (int i = 0; i < 8; i++) {
+      for (int i = 0; i < IR_SENSOR_COUNT; i++) {
           if (local_sensor.ir[i]) ir_byte |= (1 << i);
       }
       vofa_buf[4] = (float)ir_byte;
       vofa_buf[5] = local_sensor.distance_cm;
       vofa_buf[6] = (float)g_enc_total;
-      uint32_t tail = 0x7F800000;
+      uint32_t tail = 0x7F800000;     // 保持纯 +Inf 帧尾，兼容 VOFA+
       vofa_buf[7] = *(float*)&tail;
+
+      // 状态变更时发文本行（car-studio 用，VOFA+ 忽略）
+      static ChassisState_t last_reported_state = STATE_COUNT;
+      if (g_chassis_state != last_reported_state) {
+          char s_line[8];
+          int slen = snprintf(s_line, sizeof(s_line), "S:%d\n", (int)g_chassis_state);
+          if (slen > 0 && slen < (int)sizeof(s_line)) {
+              if (huart5.gState == HAL_UART_STATE_READY) {
+                  HAL_UART_Transmit(&huart5, (uint8_t*)s_line, slen, 2);
+              }
+              HAL_UART_Transmit(&huart1, (uint8_t*)s_line, slen, 10);
+          }
+          last_reported_state = g_chassis_state;
+      }
+
+      // 蓝牙 UART5 可能因 HC-06 异常而阻塞 → 先发 USB，蓝牙仅 ready 时发
+      if (huart5.gState == HAL_UART_STATE_READY) {
+          HAL_UART_Transmit(&huart5, (uint8_t*)vofa_buf, sizeof(vofa_buf), 2);
+      }
       HAL_UART_Transmit(&huart1, (uint8_t*)vofa_buf, sizeof(vofa_buf), 10);
 
       // ── I. 全局滴答 + 系统节奏 100Hz ──
@@ -408,18 +496,20 @@ void StartTaskSensor(void const * argument)
   /* USER CODE BEGIN StartTaskSensor */
   for(;;)
   {
-      // 读 8 路红外 PE0~PE7（不读超声波，避免阻塞抢占 PID 任务）
+      // 读 6 路 TCRT5000 DO 口 PE0~PE5
       SensorData_t sensor;
       uint32_t idr = GPIOE->IDR;
-      sensor.ir[0] = (idr & GPIO_PIN_0) ? 1 : 0;
-      sensor.ir[1] = (idr & GPIO_PIN_1) ? 1 : 0;
-      sensor.ir[2] = (idr & GPIO_PIN_2) ? 1 : 0;
-      sensor.ir[3] = (idr & GPIO_PIN_3) ? 1 : 0;
-      sensor.ir[4] = (idr & GPIO_PIN_4) ? 1 : 0;
-      sensor.ir[5] = (idr & GPIO_PIN_5) ? 1 : 0;
-      sensor.ir[6] = (idr & GPIO_PIN_6) ? 1 : 0;
-      sensor.ir[7] = (idr & GPIO_PIN_7) ? 1 : 0;
-      sensor.distance_cm = 300.0f; // 由 PID 任务实测，此处占位
+      // 🔧 赛道实测：TCRT5000+LM393 模块输出极性反了
+      // PIN HIGH = 黑线, PIN LOW = 白底 → 翻转映射为 ir=0=黑, ir=1=白
+      sensor.ir[0] = (idr & GPIO_PIN_0) ? 0 : 1;
+      sensor.ir[1] = (idr & GPIO_PIN_1) ? 0 : 1;
+      sensor.ir[2] = (idr & GPIO_PIN_2) ? 0 : 1;
+      sensor.ir[3] = (idr & GPIO_PIN_3) ? 0 : 1;
+      sensor.ir[4] = (idr & GPIO_PIN_4) ? 0 : 1;
+      sensor.ir[5] = (idr & GPIO_PIN_5) ? 0 : 1;
+      sensor.ir[6] = 1;  // 未接，恒为白
+      sensor.ir[7] = 1;
+      sensor.distance_cm = 300.0f;
 
       // 互斥锁写入
       if (osMutexWait(Mutex_SensorDataHandle, osWaitForever) == osOK) {
@@ -452,13 +542,12 @@ void StartTaskOLED(void const * argument)
       [STATE_IDLE]            = {HZK_02, HZK_03},  /* 待机 */
       [STATE_LINE_FOLLOW]     = {HZK_04, HZK_05},  /* 巡线 */
       [STATE_OBSTACLE]        = {HZK_06, HZK_07},  /* 避障 */
-      [STATE_GREEN_FILTER]    = {HZK_08, HZK_09},  /* 绿滤 */
-      [STATE_BREAKAWAY]       = {HZK_10, HZK_11},  /* 脱离 */
-      [STATE_VISUAL_APPROACH] = {HZK_12, HZK_13},  /* 接近 */
-      [STATE_SCANNING]        = {HZK_29, HZK_30},  /* 扫描 */
-      [STATE_DOCKING]         = {HZK_14, HZK_15},  /* 对接 */
-      [STATE_BLIND_RETURN]    = {HZK_16, HZK_17},  /* 盲返 */
-      [STATE_FINISH]          = {HZK_18, HZK_19},  /* 完成 */
+      [STATE_FINISH]          = {HZK_17, HZK_18},  /* 完成 */
+      [STATE_BRANCH_ENTER]    = {0xFF, 0xFF},       /* BR-E */
+      [STATE_BRANCH_FOLLOW]   = {0xFF, 0xFF},       /* BR-F */
+      [STATE_BRANCH_JUDGE]    = {HZK_31, HZK_32},   /* 区域 */
+      [STATE_BRANCH_REVERSE]  = {0xFF, 0xFF},       /* BR-REV */
+      [STATE_ZONE_RETURN]    = {0xFF, 0xFF},       /* Z-RET */
   };
 
   uint8_t heartbeat = 0;
@@ -476,50 +565,81 @@ void StartTaskOLED(void const * argument)
               OLED_ShowChinese(0, 0, state_cn_idx[g_chassis_state][0]);
               OLED_ShowChinese(18, 0, state_cn_idx[g_chassis_state][1]);
           } else {
-              // STATE_SCANNING ASCII fallback
-              OLED_ShowString(0, 0, (uint8_t*)"SCAN", 16, 1);
+              // ASCII fallback for states without Chinese names
+              if (g_chassis_state == STATE_BRANCH_ENTER) {
+                  OLED_ShowString(0, 0, (uint8_t*)"BR-ENT", 8, 1);
+              } else if (g_chassis_state == STATE_BRANCH_FOLLOW) {
+                  OLED_ShowString(0, 0, (uint8_t*)"BR-FLW", 8, 1);
+              } else if (g_chassis_state == STATE_BRANCH_REVERSE) {
+                  OLED_ShowString(0, 0, (uint8_t*)"BR-REV", 8, 1);
+              } else if (g_chassis_state == STATE_ZONE_RETURN) {
+                  OLED_ShowString(0, 0, (uint8_t*)"Z-RET", 8, 1);
+              } else {
+                  OLED_ShowString(0, 0, (uint8_t*)"SCAN", 16, 1);
+              }
           }
 
-          OLED_ShowString(0, 18, (uint8_t*)"R:", 16, 1);
-          OLED_ShowNum(24, 18, g_red_count, 3, 16, 1);
-          OLED_ShowString(64, 18, (uint8_t*)"G:", 16, 1);
-          OLED_ShowNum(88, 18, g_green_count, 3, 16, 1);
+                    // Zone info for BRANCH states
+          if (g_chassis_state == STATE_BRANCH_JUDGE ||
+              g_chassis_state == STATE_BRANCH_REVERSE ||
+              g_chassis_state == STATE_ZONE_RETURN) {
+              OLED_ShowChinese(36, 18, HZK_31);   /* qu */
+              OLED_ShowChinese(54, 18, HZK_32);   /* yu */
+              OLED_ShowNum(72, 18, g_branch_zone, 1, 16, 1);
 
-          OLED_ShowString(0, 36, (uint8_t*)"V:", 16, 1);
-          OLED_ShowFloat(24, 36, g_avg_speed_mps, 16, 1);
-          OLED_ShowString(96, 36, (uint8_t*)"m/s", 16, 1);
-
-          if (g_emergency_stop) {
-              OLED_ShowString(0, 54, (uint8_t*)"VOFA:OK !STOP!", 8, 1);
+              if (g_chassis_state == STATE_BRANCH_JUDGE) {
+                  OLED_ShowChinese(0, 36, HZK_21);   /* hong */
+                  OLED_ShowString(16, 36, (uint8_t*)":", 16, 1);
+                  OLED_ShowNum(24, 36, g_branch_decision.total_red, 2, 16, 1);
+                  OLED_ShowChinese(56, 36, HZK_08);   /* lv */
+                  OLED_ShowString(72, 36, (uint8_t*)":", 16, 1);
+                  OLED_ShowNum(80, 36, g_branch_decision.total_green, 2, 16, 1);
+                  if (g_branch_decision.pick) {
+                      OLED_ShowString(0, 54, (uint8_t*)"Pick:ripe ", 8, 1);
+                  } else if (g_branch_decision.detected) {
+                      OLED_ShowString(0, 54, (uint8_t*)"Skip:unripe", 8, 1);
+                  } else {
+                      OLED_ShowString(0, 54, (uint8_t*)"No target  ", 8, 1);
+                  }
+              } else {
+                  OLED_ShowString(0, 36, (uint8_t*)"Total R:", 8, 1);
+                  OLED_ShowNum(56, 36, g_red_count, 3, 16, 1);
+                  OLED_ShowString(0, 54, (uint8_t*)"Total G:", 8, 1);
+                  OLED_ShowNum(56, 54, g_green_count, 3, 16, 1);
+              }
           } else {
-              OLED_ShowString(0, 54, (uint8_t*)"VOFA:OK", 8, 1);
+              OLED_ShowString(0, 18, (uint8_t*)"R:", 16, 1);
+              OLED_ShowNum(24, 18, g_red_count, 3, 16, 1);
+              OLED_ShowString(64, 18, (uint8_t*)"G:", 16, 1);
+              OLED_ShowNum(88, 18, g_green_count, 3, 16, 1);
+
+              OLED_ShowString(0, 36, (uint8_t*)"V:", 16, 1);
+              OLED_ShowFloat(24, 36, g_avg_speed_mps, 16, 1);
+              OLED_ShowString(96, 36, (uint8_t*)"m/s", 16, 1);
+
+              if (g_emergency_stop) {
+                  OLED_ShowString(0, 54, (uint8_t*)"VOFA:OK !STOP!", 8, 1);
+              } else {
+                  OLED_ShowString(0, 54, (uint8_t*)"VOFA:OK", 8, 1);
+              }
+              OLED_ShowChar(120, 54, (heartbeat & 1) ? '*' : '.', 8, 1);
           }
-          OLED_ShowChar(120, 54, (heartbeat & 1) ? '*' : '.', 8, 1);
 
           OLED_Refresh();
 
-          /* 蜂鸣器：DOCKING 时由 chassis.c run_docking 直接控制；
-             其他状态保持心跳蜂鸣 */
-          if (g_chassis_state != STATE_DOCKING) {
-              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
-              osDelay(20);
-              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
-              osDelay(180);  /* 5Hz */
-          } else {
-              osDelay(200);  /* DOCKING 时 OLED 跳过蜂鸣，仅刷新 */
-          }
+          /* 心跳蜂鸣 5Hz */
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+          osDelay(20);
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+          osDelay(180);  /* 5Hz */
       }
       else
       {
           /* ─── OLED 故障：降级为蜂鸣器心跳 + 定期重试 ─── */
-          if (g_chassis_state != STATE_DOCKING) {
-              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
-              osDelay(50);
-              HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
-              osDelay(150);
-          } else {
-              osDelay(200);  /* DOCKING 时不碰蜂鸣 */
-          }
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
+          osDelay(50);
+          HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET);
+          osDelay(150);
 
           /* 每 ~3 秒重试初始化 */
           if (++retry_tick >= 15) {
@@ -541,6 +661,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     extern uint8_t rx_index;
     extern volatile uint8_t rx_flag;
     extern uint8_t rx_byte;
+    extern uint8_t rx_byte_bt;
 
     // ── USART1: VOFA+ 文本命令行（'\n' 换行结束） ──
     if (huart->Instance == USART1) {
@@ -556,6 +677,21 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             }
         }
         HAL_UART_Receive_IT(huart, &rx_byte, 1);
+    }
+    // ── UART4: 蓝牙文本命令行（与 USART1 共用 rx_buf） ──
+    else if (huart->Instance == UART4) {
+        if (rx_byte_bt == '\n') {
+            if (rx_index > 0) {
+                rx_buf[rx_index] = '\0';
+                rx_flag = 1;
+                rx_index = 0;
+            }
+        } else if (rx_byte_bt != '\r') {
+            if (rx_index < 31) {
+                rx_buf[rx_index++] = rx_byte_bt;
+            }
+        }
+        HAL_UART_Receive_IT(huart, &rx_byte_bt, 1);
     }
     // USART2 已改用 DMA + IDLE，不再走逐字节中断
 }

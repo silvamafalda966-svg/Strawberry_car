@@ -36,12 +36,18 @@ extern UART_HandleTypeDef huart1;
 
 extern UART_HandleTypeDef huart2;
 
+extern UART_HandleTypeDef huart4;  // 蓝牙 RX (PC11)
+
+extern UART_HandleTypeDef huart5;  // 蓝牙 TX (PC12)
+
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 
 void MX_USART1_UART_Init(void);
 void MX_USART2_UART_Init(void);
+void MX_UART4_UART_Init(void);  // 蓝牙 RX
+void MX_UART5_UART_Init(void);  // 蓝牙 TX
 
 /* USER CODE BEGIN Prototypes */
 

@@ -3,32 +3,37 @@
 
 #include "main.h"
 
-/* ────────── 10 状态枚举 ────────── */
+/* ────────── 状态枚举（v2 岔路方案 + Zone Demo） ────────── */
 typedef enum {
     STATE_DEBUG = 0,        // VOFA+ 手动调参
     STATE_IDLE,             // 空闲等待
-    STATE_LINE_FOLLOW,      // 红外巡线行驶
+    STATE_LINE_FOLLOW,      // 红外巡线行驶（含岔路口检测）
     STATE_OBSTACLE,         // 超声波避障绕行
-    STATE_GREEN_FILTER,     // 绿草莓抗干扰（保留，暂未用）
-    STATE_BREAKAWAY,        // 脱离巡线 → 视觉伺服转向植株
-    STATE_VISUAL_APPROACH,  // 双轴伺服前进靠近植株
-    STATE_SCANNING,         // 静止扫描统计（固定窗口）
-    STATE_DOCKING,          // 蜂鸣上报，采摘确认
-    STATE_BLIND_RETURN,     // 倒退回赛道 + 回正
     STATE_FINISH,           // 任务完成
-    STATE_COUNT             // 哨兵值 = 11
+    STATE_BRANCH_ENTER,     // 岔路检测 → 原地转弯进入分支线
+    STATE_BRANCH_FOLLOW,    // 沿分支线前进，超声波监测距离
+    STATE_BRANCH_JUDGE,     // 停车，K210 判定成熟度+大小
+    STATE_BRANCH_REVERSE,   // 直线倒车返回主赛道
+    STATE_ZONE_RETURN,      // Zone Demo 返程：掉头180°→巡线倒退→START停车
+    STATE_COUNT
 } ChassisState_t;
+
+/* ────────── TCRT5000 红外参数 ────────── */
+// 6 路等间距排列，总宽 10cm，DO 口数字输出
+// DO=0 表示黑线，DO=1 表示白底（LM393 比较器）
+#define IR_SENSOR_COUNT      6           // PE0~PE5 有效传感器数
+#define IR_CENTER_OFFSET     2.5f        // (IR_SENSOR_COUNT-1)/2 = 2.5
 
 /* ────────── 传感器数据结构体（对齐 1 字节） ────────── */
 #pragma pack(1)
 typedef struct {
-    uint8_t ir[8];          // PE0(最左) ~ PE7(最右), 0=黑线
-    float   distance_cm;    // HC-SR04 超声波测距
+    uint8_t  ir[8];         // PE0~PE5 = TCRT5000 DO(0=黑 1=白), PE6~PE7 = 保留(1)
+    float    distance_cm;   // HC-SR04 超声波测距
 } SensorData_t;
 
 /* ── K210 视觉帧（v5：定长 24B 多目标批量帧） ── */
 typedef struct {
-    uint8_t cls;            // 0=绿草莓(未熟), 1=红草莓(成熟)
+    uint8_t cls;            // 0=红草莓(成熟/ripe), 1=绿草莓(未熟/unripe)
     uint8_t x;              // 水平坐标 0~255（K210 320→255 压缩）
     uint8_t y;              // 垂直坐标 0~240
     uint8_t area;           // 面积百分比 0~100
@@ -75,53 +80,91 @@ typedef enum {
     OB_DONE
 } ObsSubStage_t;
 
-/* ────────── Phase 2 可调参数（巡线 + 避障，不变） ────────── */
+/* ═══════════════════════════════════════════════════════════════
+   🔧 赛道实测校准参数（7月8日上赛道第一件事：测这三个！）
+   ═══════════════════════════════════════════════════════════════ */
+
+// [1] 直线里程校准 — 巡线跑 2m 直道，录 enc 值，除以 5414
+//     理论: 2707 enc/cm，赛道实际有打滑
+//     例: enc=6500 → 因子=6500/5414=1.20 → 改下面这行
+#define ENC_PER_CM          2789   // 赛道实测: 284500enc/102cm=2789
+
+// [2] 原地90°转弯 — 赛道地面原地右转 90°，car-studio 录 g_turn_enc
+//     当前为地板实测值，赛道上必须重测！
+#define TURN90_TOTAL_ENC    199700 // 赛道实测: 209700×90/94.5
+#define TURN45_TOTAL_ENC    (TURN90_TOTAL_ENC / 2)
+
+// [3] 原地180°掉头 — 赛道地面原地右转 180°，car-studio 录 g_turn_enc
+//     测法: MD→WA T0.15→W0 T0.15→W2 T0.15→W1 T-0.15→W3 T-0.15→转够180°→T0
+#define TURN180_TOTAL_ENC   399400 // 赛道实测: =TURN90×2
+
+// [4] 岔路编码器匹配容差 — Zone 匹配时允许的编码器偏差
+//     25cm × ENC_PER_CM ≈ 68000
+#define ZONE_ENC_TOLERANCE  68000  // 约 ±25cm，赛道实测后根据精度调整
+
+/* ═══════════════════════════════════════════════════════════════ */
+
+/* ────────── Phase 2 可调参数（巡线 + 避障） ────────── */
 #define LINE_KP             0.04f
 #define LINE_BASE_SPEED     0.3f
 #define OB_BACK_SPEED       0.2f
 #define OB_FWD_SPEED        0.3f
 #define OB_TURN_SPEED       0.15f
-#define OB_TURN_MS          800
-#define OB_BACK_CM          10.0f
+#define OB_TURN_MS          2000
+#define OB_BACK_CM          5.0f   // 10→5, 倒车距离缩短
 #define OB_CROSS_CM         25.0f
-#define OB_FORWARD_CM       30.0f
-#define ENC_PER_CM          2707
-#define TURN90_TOTAL_ENC    118200
-#define TURN45_TOTAL_ENC    59100
+#define OB_FORWARD_CM       47.0f  // 绕过障碍物的前进距离
 #define OB_FWD_TO_LINE_CM   50.0f
-#define OB_BRAKE_TIMEOUT    100
+#define OB_BRAKE_TIMEOUT    50     // 100→50, 各阶段停顿减半
 #define ENABLE_ULTRASONIC   1
 #define FORCE_STRAIGHT      0
 
-/* ────────── Phase 3 可调参数（草莓检测链 v5） ────────── */
-// 触发
-#define PLANT_X_LEFT        80      // X<此值=植株在左侧，触发
-#define PLANT_X_RIGHT       200     // X>此值=植株在右侧，触发
-#define TRIGGER_CONFIRM     3       // 连续确认帧数
+/* ────────── Phase 2 岔路采摘参数 ────────── */
+// 岔路口检测
+#define JUNCTION_CONFIRM_FRAMES  3      // 连续 N 帧 6 路全黑 = 岔路确认
+#define JUNCTION_SIDE           -1      // 🔧 草莓区内侧：左转进入分支 (-1=左转, 1=右转)
+#define JUNCTION_SUPPRESS_MS     3000   // 出岔路后抑制重触发 (ms)
+#define BRANCH_FWD_BEFORE_TURN_CM 13.0f  // 检测到岔路后前进距离：传感器→几何中心 (cm)
 
-// 视觉伺服
-#define X_CENTER_PX         160     // 画面水平中心
-#define Y_CENTER_PX         120     // 画面垂直中心
-#define X_DEADBAND_PX       15      // X 对中死区（像素）
-#define Y_DEADBAND_PX       10      // Y 对中死区（像素，舵机不动）
-#define Y_FILT_NEW          0.3f    // Y 一阶低通新值权重
-#define TURN_SERVO_SPEED    0.15f   // 原地视觉伺服转向速度 (m/s)
+// 分支线巡线
+#define BRANCH_FOLLOW_SPEED      0.2f   // 分支线巡线速度 (m/s)
+#define BRANCH_LINE_KP           0.04f  // 分支线 P 控制器增益
 
-// 前进靠近
-#define APPROACH_BASE_SPEED 0.20f   // 靠近初始速度 (m/s)
-#define APPROACH_MIN_SPEED  0.08f   // 靠近最低速度 (m/s)
-#define APPROACH_AREA_STOP  20      // Area≥此值可停车（%）
-#define APPROACH_CENTER_OK  10      // X 居中连续稳定帧数
+// 超声波停车
+#define BRANCH_STOP_DIST_CM      36.0f  // 超声波 < 此值停车 (cm)
+#define BRANCH_STOP_CONFIRM      5      // 连续 N 帧满足距离才停车
 
-// 静止扫描
-#define SCAN_FRAMES         50      // 采样窗口（50帧 = 0.5s @ 100Hz）
+// 判定
+#define BRANCH_JUDGE_TICKS       300    // 停车后采集 N 帧 K210 数据（3s）
+#define BRANCH_AREA_MIN          5      // 面积 < 此值视为噪声/误检
 
-// 倒车回线
-#define RETURN_SPEED        0.3f    // 倒车速度 (m/s)
-#define RETURN_SPIN_SPEED   0.15f   // 找线自旋速度 (m/s)
+// 倒车返回
+#define BRANCH_REVERSE_SPEED     0.25f  // 倒车速度 (m/s)
+#define BRANCH_REVERSE_MAX_CM    100.0f // 倒车最大距离（安全超时）
 
-// 防重触发
-#define POST_DOCK_SUPPRESS_MS  2000 // 摘完一株后 N ms 内不触发（滴答 = 10ms）
+/* ── Zone Demo 返程参数 ── */
+#define ZONE_RETURN_SPEED          0.2f   // 返程倒退巡线速度 (m/s)
+#define ZONE_START_ENC_THRESHOLD   500    // 编码器 < 此值认为回到 START (约 2cm)
+#define ZONE_RETURN_MAX_MS         30000  // 返程最长时限 30 秒（安全超时）
+
+/* ── 岔路判定结果（供 OLED 显示） ── */
+typedef struct {
+    uint8_t  detected;      // 0=无草莓, 1=有有效目标
+    uint8_t  cls;           // 0=红(ripe), 1=绿(unripe)
+    uint8_t  area;          // 选中目标的面积
+    uint8_t  total_red;     // 视野中红草莓总数
+    uint8_t  total_green;   // 视野中绿草莓总数
+    uint8_t  pick;          // 1=采摘, 0=跳过(绿/太小)
+} BranchDecision_t;
+
+extern BranchDecision_t g_branch_decision;
+extern uint8_t          g_branch_zone;     // 当前区域编号（每进岔路+1）
+
+/* ── Zone Demo 任务状态 ── */
+extern uint8_t  g_zone_active;       // 1=Zone Demo 模式中
+extern uint8_t  g_zone_id;           // 目标 Zone 编号（1~N）
+extern int32_t  g_zone_target_enc;   // 目标岔路的预期编码器值
+extern uint8_t  g_zone_done;         // 1=已完成判定，准备返程
 
 /* ────────── Chassis_Move API（只设 Target，不碰 PWM） ────────── */
 void Chassis_MoveForward(float speed_mps);

@@ -49,7 +49,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-extern uint8_t rx_byte; // UART receive byte used by HAL_UART_Receive_IT
+extern uint8_t rx_byte;    // USART1 RX byte
+extern uint8_t rx_byte_bt; // UART4 蓝牙 RX byte
 
 /* USER CODE END PV */
 
@@ -105,8 +106,10 @@ int main(void)
   MX_TIM8_Init();
   MX_TIM6_Init();
   MX_USART1_UART_Init();
+  MX_UART4_UART_Init();   // 蓝牙 RX (PC11)
+  MX_UART5_UART_Init();   // 蓝牙 TX (PC12)
   /* USER CODE BEGIN 2 */
-  
+
   // 1. 唤醒 PWM 动力系统
   Motor_Init();
   PID_Init();
@@ -116,7 +119,8 @@ int main(void)
   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL); // 左后 (BL)
   HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL); // 右前 (FR)
   HAL_TIM_Encoder_Start(&htim8, TIM_CHANNEL_ALL); // 右后 (BR)
-HAL_UART_Receive_IT(&huart1, &rx_byte, 1); // USART1 = VOFA+ 调试指令通道
+HAL_UART_Receive_IT(&huart1, &rx_byte, 1); // USART1 = VOFA+ USB 调试指令通道
+HAL_UART_Receive_IT(&huart4, &rx_byte_bt, 1); // UART4 = 蓝牙指令通道
   /* USER CODE END 2 */
 
   /* Call init function for freertos objects (in cmsis_os2.c) */

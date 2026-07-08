@@ -59,6 +59,7 @@ extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
+extern UART_HandleTypeDef huart4;
 extern TIM_HandleTypeDef htim7;
 extern DMA_HandleTypeDef  hdma_usart2_rx;
 
@@ -207,6 +208,14 @@ void USART2_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles UART4 global interrupt (蓝牙 RX).
+  */
+void UART4_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart4);
+}
+
+/**
   * @brief This function handles TIM6 global interrupt, DAC1 and DAC2 underrun error interrupts.
   */
 void TIM6_DAC_IRQHandler(void)
@@ -247,6 +256,7 @@ void DMA1_Stream5_IRQHandler(void)
 
   /* USER CODE END DMA1_Stream5_IRQn 1 */
 }
+
 
 /* USER CODE BEGIN 1 */
 
