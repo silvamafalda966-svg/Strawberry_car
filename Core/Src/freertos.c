@@ -35,6 +35,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include "mpu6050.h"
+
+/* USART1 (USB/CH340) 调试开关：1=开启, 0=关闭省 CPU */
+#define UART1_DEBUG 1  // 🔧 陀螺仪调试：USB 输出
+#define USE_MPU6050 0  // 🔧 陀螺仪开关：1=启用, 0=禁用（不用陀螺仪设0，避免I2C超时拖慢PID）
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,6 +67,7 @@ uint8_t rx_byte_bt;  // 蓝牙 UART4 接收字节
 // K210 DMA 定长 24B 接收缓冲区
 uint8_t  k210_dma_buf[24];
 volatile uint8_t k210_frame_ready = 0;  // IDLE 中断置位，PID任务消费
+volatile uint32_t k210_frame_count = 0; // 调试：收到的有效帧总数
 // 传感器数据（Task_Sensor 写，Task_PID_Ctrl 读）
 static SensorData_t g_sensor_data = {{1,1,1,1,1,1,1,1}, 300.0f};
 /* USER CODE END Variables */
@@ -71,6 +77,7 @@ osThreadId Task_SensorHandle;
 osThreadId Task_OLEDHandle;
 QueueHandle_t xQueue_VisionData;   // 24B 定长帧队列（FreeRTOS 原生）
 osMutexId Mutex_SensorDataHandle;
+osMutexId Mutex_I2C2Handle;        // I2C2 总线互斥锁（OLED 专用，MPU6050 已迁 I2C1）
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -119,6 +126,10 @@ void MX_FREERTOS_Init(void) {
   osMutexDef(Mutex_SensorData);
   Mutex_SensorDataHandle = osMutexCreate(osMutex(Mutex_SensorData));
 
+  /* I2C2 总线互斥锁（OLED + MPU6050 共享） */
+  osMutexDef(Mutex_I2C2);
+  Mutex_I2C2Handle = osMutexCreate(osMutex(Mutex_I2C2));
+
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   /* USER CODE END RTOS_MUTEX */
@@ -149,7 +160,7 @@ void MX_FREERTOS_Init(void) {
   Task_VisionHandle = osThreadCreate(osThread(Task_Vision), NULL);
 
   /* definition and creation of Task_Sensor */
-  osThreadDef(Task_Sensor, StartTaskSensor, osPriorityHigh, 0, 256);
+  osThreadDef(Task_Sensor, StartTaskSensor, osPriorityBelowNormal, 0, 256);
   Task_SensorHandle = osThreadCreate(osThread(Task_Sensor), NULL);
 
   /* definition and creation of Task_OLED */
@@ -206,22 +217,97 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 void StartTaskChassis(void const * argument)
 {
   /* USER CODE BEGIN StartTaskChassis */
-  // 1. 四轮初始 PID 参数（防死锁）
-  // Systematically tuned 2026-06-13 (Kp→Ki→Kd full sweep)
-  // FL/FR/BL: score=8, rise=96ms, overshoot=0.5%
-  pid_FL.direction = 1; pid_FL.Kp = 0.20f; pid_FL.Ki = 0.08f; pid_FL.Kd = 0.02f; pid_FL.Target = 0.0f;
-  pid_BL.direction = 1; pid_BL.Kp = 0.20f; pid_BL.Ki = 0.08f; pid_BL.Kd = 0.02f; pid_BL.Target = 0.0f;
-  pid_FR.direction = 1; pid_FR.Kp = 0.20f; pid_FR.Ki = 0.08f; pid_FR.Kd = 0.02f; pid_FR.Target = 0.0f;
-  // BR: score=26, rise=107ms, over=1.4%, plateau=95ms (mechanical friction dead zone)
-  pid_BR.direction = 1; pid_BR.Kp = 0.35f; pid_BR.Ki = 0.08f; pid_BR.Kd = 0.10f; pid_BR.Target = 0.0f;
+  // 1. 四轮初始 PID 参数（防死锁，与 PID_Init() 保持一致）
+  // V2 自动调参 2026-07-17: 四轮统一 Kp=0.25 Ki=0.05 Kd=0.06
+  pid_FL.direction = 1; pid_FL.Kp = 0.25f; pid_FL.Ki = 0.05f; pid_FL.Kd = 0.06f; pid_FL.Target = 0.0f;
+  pid_BL.direction = 1; pid_BL.Kp = 0.25f; pid_BL.Ki = 0.05f; pid_BL.Kd = 0.06f; pid_BL.Target = 0.0f;
+  pid_FR.direction = 1; pid_FR.Kp = 0.25f; pid_FR.Ki = 0.05f; pid_FR.Kd = 0.06f; pid_FR.Target = 0.0f;
+  pid_BR.direction = 1; pid_BR.Kp = 0.25f; pid_BR.Ki = 0.05f; pid_BR.Kd = 0.06f; pid_BR.Target = 0.0f;
 
   // 2. 引用 USART1/UART4/UART5 句柄（中断已在 main.c 启动）
   extern UART_HandleTypeDef huart1;
   extern UART_HandleTypeDef huart4;
   extern UART_HandleTypeDef huart5;
+  extern I2C_HandleTypeDef hi2c1;
 
   // 3. 状态机初始化
   Chassis_Init();
+
+  // 4. MPU6050 陀螺仪初始化（已禁用 — USE_MPU6050=0）
+#if USE_MPU6050
+  int mpu_ok = 0;
+  float self_test_result[6] = {0};
+  float gyro_bias_dps = 0.0f;
+
+  for (int retry = 0; retry < 3; retry++) {
+      mpu_ok = MPU6050_Init(&hi2c1);
+      if (mpu_ok) break;
+      osDelay(50);
+  }
+  if (mpu_ok) {
+      // Step A: 自检（验证芯片健康）
+      uint8_t st_pass = MPU6050_SelfTest(&hi2c1, self_test_result);
+
+      // Step B: 预热等待（温度稳定后自动校准）
+      osDelay(500);  // 等自检后芯片恢复
+      float last_temp = MPU6050_ReadTemp(&hi2c1);
+      // 如果温度读失败（返回 0），说明 I2C 还没稳，重试
+      if (last_temp < 10.0f) {
+          osDelay(1000);
+          last_temp = MPU6050_ReadTemp(&hi2c1);
+      }
+      int warmup_sec = 0, stable_cnt = 0;
+      const int WARMUP_MAX_SEC = 120;
+      char w_line[32];
+
+      while (warmup_sec < WARMUP_MAX_SEC) {
+          osDelay(5000);
+          warmup_sec += 5;
+          float cur_temp = MPU6050_ReadTemp(&hi2c1);
+          if (cur_temp < 10.0f) cur_temp = last_temp;  // 读失败保持上次值
+          float delta = (cur_temp > last_temp) ? (cur_temp - last_temp)
+                                               : (last_temp - cur_temp);
+          last_temp = cur_temp;
+
+          if (delta < 0.2f) {
+              if (++stable_cnt >= 3) break;
+          } else {
+              stable_cnt = 0;
+          }
+
+          int pct = (warmup_sec * 100) / WARMUP_MAX_SEC;
+          int wlen = snprintf(w_line, sizeof(w_line), "W:%d,%d\n",
+                              pct, (int)(cur_temp * 10.0f));
+          if (wlen > 0 && wlen < (int)sizeof(w_line)) {
+              HAL_UART_Transmit(&huart1, (uint8_t*)w_line, wlen, 10);
+          }
+      }
+
+      // Step C: FIFO 零偏校准（写入硬件偏移寄存器）
+      gyro_bias_dps = MPU6050_Calibrate(&hi2c1, 80);
+      g_mpu6050_alive = 1;  // 校准成功，标记陀螺仪可用
+
+      (void)st_pass;
+      (void)gyro_bias_dps;
+  }
+  float yaw_deg = g_mpu6050_yaw;  // yaw 积分变量（从上次保留值继续）
+
+  // 调试：M: 行（包含更多信息）
+  {
+      char dbg[64];
+      int dlen = snprintf(dbg, sizeof(dbg), "M:%d,%d,%d,%d\n",
+                          mpu_ok,
+                          (int)(self_test_result[5]),  // 陀螺 Z 自检%
+                          (int)(gyro_bias_dps * 100.0f),  // 零偏 (厘度)
+                          (int)(g_mpu6050_alive));
+      if (dlen > 0 && dlen < (int)sizeof(dbg)) {
+          HAL_UART_Transmit(&huart1, (uint8_t*)dbg, dlen, 10);
+      }
+  }
+#else
+  int mpu_ok = 0;
+  (void)mpu_ok;
+#endif /* USE_MPU6050 */
 
   // EMA 滤波状态（编码器速度低通滤波，降噪）
   float filt_FL = 0.0f, filt_FR = 0.0f, filt_BL = 0.0f, filt_BR = 0.0f;
@@ -286,12 +372,16 @@ void StartTaskChassis(void const * argument)
       }
 
       // ── D. 传感器数据获取（互斥锁） ──
+      // 🔒 fallback 用上次成功值，不用 memset(0)！
+      //    memset(0) → ir全黑 → 假岔路口 → 误拐出赛道
+      static SensorData_t last_local_sensor = {{1,1,1,1,1,1,1,1}, 300.0f};
       SensorData_t local_sensor;
-      memset(&local_sensor, 0, sizeof(local_sensor));
-      local_sensor.distance_cm = 300.0f;
       if (osMutexWait(Mutex_SensorDataHandle, 0) == osOK) {
           local_sensor = g_sensor_data;
+          last_local_sensor = g_sensor_data;  // 存档，供下次 fallback
           osMutexRelease(Mutex_SensorDataHandle);
+      } else {
+          local_sensor = last_local_sensor;   // 锁不到用上次值
       }
 
       // ── D2. 超声波测距（中断驱动，零阻塞；20Hz 触发一次） ──
@@ -333,19 +423,23 @@ void StartTaskChassis(void const * argument)
       // ── F2. K210 决策文本行上报（BRANCH_JUDGE → BRANCH_REVERSE 时触发一次） ──
       if (prev_chassis_state == STATE_BRANCH_JUDGE
           && g_chassis_state == STATE_BRANCH_REVERSE) {
-          char d_line[32];
+          char d_line[48];
           int len = snprintf(d_line, sizeof(d_line),
-                             "D:%d,%d,%d,%d,%d\n",
+                             "D:%d,%d,%d,%d,%d,%d,%d\n",
                              g_branch_decision.pick,
                              g_branch_decision.cls,
                              g_branch_decision.area,
                              g_branch_decision.total_red,
-                             g_branch_decision.total_green);
+                             g_branch_decision.total_green,
+                             g_branch_decision.frames_in,
+                             g_branch_decision.frames_ok);
           if (len > 0 && len < (int)sizeof(d_line)) {
               if (huart5.gState == HAL_UART_STATE_READY) {
-                  HAL_UART_Transmit(&huart5, (uint8_t*)d_line, len, 2);
+                  HAL_UART_Transmit(&huart5, (uint8_t*)d_line, len, 5);
               }
+#if UART1_DEBUG
               HAL_UART_Transmit(&huart1, (uint8_t*)d_line, len, 10);
+#endif
           }
       }
 
@@ -361,9 +455,11 @@ void StartTaskChassis(void const * argument)
                               g_green_count);
           if (clen > 0 && clen < (int)sizeof(c_line)) {
               if (huart5.gState == HAL_UART_STATE_READY) {
-                  HAL_UART_Transmit(&huart5, (uint8_t*)c_line, clen, 2);
+                  HAL_UART_Transmit(&huart5, (uint8_t*)c_line, clen, 5);
               }
+#if UART1_DEBUG
               HAL_UART_Transmit(&huart1, (uint8_t*)c_line, clen, 10);
+#endif
           }
       }
       prev_chassis_state = g_chassis_state;
@@ -384,9 +480,11 @@ void StartTaskChassis(void const * argument)
                   int klen = snprintf(k_line, sizeof(k_line), "K:%d\n", (int)g_enc_total);
                   if (klen > 0 && klen < (int)sizeof(k_line)) {
                       if (huart5.gState == HAL_UART_STATE_READY) {
-                          HAL_UART_Transmit(&huart5, (uint8_t*)k_line, klen, 2);
+                          HAL_UART_Transmit(&huart5, (uint8_t*)k_line, klen, 5);
                       }
+#if UART1_DEBUG
                       HAL_UART_Transmit(&huart1, (uint8_t*)k_line, klen, 10);
+#endif
                   }
                   marker_cnt = 0;
                   marker_cooldown = 50;  // 500ms 冷却，防重复触发
@@ -427,8 +525,8 @@ void StartTaskChassis(void const * argument)
       }
       vofa_buf[4] = (float)ir_byte;
       vofa_buf[5] = local_sensor.distance_cm;
-      vofa_buf[6] = (float)g_enc_total;
-      uint32_t tail = 0x7F800000;     // 保持纯 +Inf 帧尾，兼容 VOFA+
+      vofa_buf[6] = g_mpu6050_yaw;  // 陀螺仪 yaw 角度 (°)，替换编码器
+      uint32_t tail = 0x7F800000;     // 保持纯 +Inf 帧尾，兼容 car-studio 帧同步
       vofa_buf[7] = *(float*)&tail;
 
       // 状态变更时发文本行（car-studio 用，VOFA+ 忽略）
@@ -438,18 +536,79 @@ void StartTaskChassis(void const * argument)
           int slen = snprintf(s_line, sizeof(s_line), "S:%d\n", (int)g_chassis_state);
           if (slen > 0 && slen < (int)sizeof(s_line)) {
               if (huart5.gState == HAL_UART_STATE_READY) {
-                  HAL_UART_Transmit(&huart5, (uint8_t*)s_line, slen, 2);
+                  HAL_UART_Transmit(&huart5, (uint8_t*)s_line, slen, 5);
               }
+#if UART1_DEBUG
               HAL_UART_Transmit(&huart1, (uint8_t*)s_line, slen, 10);
+#endif
           }
           last_reported_state = g_chassis_state;
       }
 
-      // 蓝牙 UART5 可能因 HC-06 异常而阻塞 → 先发 USB，蓝牙仅 ready 时发
+      // ── VOFA+ 帧发送 ──
       if (huart5.gState == HAL_UART_STATE_READY) {
-          HAL_UART_Transmit(&huart5, (uint8_t*)vofa_buf, sizeof(vofa_buf), 2);
+          HAL_UART_Transmit(&huart5, (uint8_t*)vofa_buf, sizeof(vofa_buf), 5);
       }
+#if UART1_DEBUG
       HAL_UART_Transmit(&huart1, (uint8_t*)vofa_buf, sizeof(vofa_buf), 10);
+#endif
+
+      // ── 调试：V: K210帧计数器（1Hz） ──
+      static uint8_t vdbg_tick = 0;
+      if (++vdbg_tick >= 100) {
+          vdbg_tick = 0;
+          extern volatile uint32_t k210_frame_count;
+          char v_line[16];
+          int vlen = snprintf(v_line, sizeof(v_line), "V:%d\n", (int)k210_frame_count);
+          if (vlen > 0 && vlen < (int)sizeof(v_line)) {
+#if UART1_DEBUG
+              HAL_UART_Transmit(&huart1, (uint8_t*)v_line, vlen, 10);
+#endif
+          }
+      }
+
+      // ── H2. MPU6050 陀螺仪读取 + yaw 积分 ──
+#if USE_MPU6050
+      if (mpu_ok) {
+          uint8_t gz_ok = 0;
+          float gz = MPU6050_ReadGyroZ(&hi2c1, &gz_ok);
+          if (gz_ok) {
+              g_mpu6050_alive = 1;
+
+              // 真实 dt（FreeRTOS tick，毫秒级精度）
+              static TickType_t last_tick = 0;
+              TickType_t now = xTaskGetTickCount();
+              float dt = (float)(now - last_tick) / 1000.0f;
+              last_tick = now;
+              if (dt > 0.1f || dt <= 0.0f) dt = 0.01f;
+
+              // 静止检测：陀螺仪方差法（连续 N 帧波动 < 阈值 = 真静止）
+              static float gz_last = 0.0f;
+              static uint8_t still_cnt = 0;
+              float gz_var = (gz > gz_last) ? (gz - gz_last) : (gz_last - gz);
+              gz_last = gz;
+              if (gz_var < 0.15f) {  // < 0.15°/s 波动 = 静止
+                  if (still_cnt < 255) still_cnt++;
+              } else {
+                  still_cnt = 0;
+              }
+
+              // 静止时小死区（滤除零偏残余和噪声）
+              if (still_cnt >= 10) {
+                  if (gz > -0.08f && gz < 0.08f) gz = 0.0f;
+              }
+
+              // 积分（硬件零偏已自动扣除 + 软件低通已平滑 + 灵敏度已修正）
+              yaw_deg += gz * dt;
+              // 回卷到 [0, 360)，方便 VOFA+ 观看
+              while (yaw_deg >=  360.0f) yaw_deg -= 360.0f;
+              while (yaw_deg <     0.0f) yaw_deg += 360.0f;
+              g_mpu6050_yaw = yaw_deg;
+          } else {
+              g_mpu6050_alive = 0;
+          }
+      }
+#endif /* USE_MPU6050 */
 
       // ── I. 全局滴答 + 系统节奏 100Hz ──
       g_sys_tick++;
@@ -494,31 +653,47 @@ void StartTaskVision(void const * argument)
 void StartTaskSensor(void const * argument)
 {
   /* USER CODE BEGIN StartTaskSensor */
+  extern UART_HandleTypeDef huart1;
+  extern UART_HandleTypeDef huart5;
+  /* MPU6050 moved to PID task (100Hz). Sensor task: IR + Y: report only */
   for(;;)
   {
-      // 读 6 路 TCRT5000 DO 口 PE0~PE5
       SensorData_t sensor;
       uint32_t idr = GPIOE->IDR;
-      // 🔧 赛道实测：TCRT5000+LM393 模块输出极性反了
-      // PIN HIGH = 黑线, PIN LOW = 白底 → 翻转映射为 ir=0=黑, ir=1=白
       sensor.ir[0] = (idr & GPIO_PIN_0) ? 0 : 1;
       sensor.ir[1] = (idr & GPIO_PIN_1) ? 0 : 1;
       sensor.ir[2] = (idr & GPIO_PIN_2) ? 0 : 1;
       sensor.ir[3] = (idr & GPIO_PIN_3) ? 0 : 1;
       sensor.ir[4] = (idr & GPIO_PIN_4) ? 0 : 1;
       sensor.ir[5] = (idr & GPIO_PIN_5) ? 0 : 1;
-      sensor.ir[6] = 1;  // 未接，恒为白
+      sensor.ir[6] = 1;
       sensor.ir[7] = 1;
       sensor.distance_cm = 300.0f;
 
-      // 互斥锁写入
+      /* Y: yaw report (10Hz, USB + Bluetooth) */
+      static uint8_t yaw_tick = 0;
+      if (++yaw_tick >= 5) {
+          yaw_tick = 0;
+          char y_line[32];
+          int ylen = snprintf(y_line, sizeof(y_line), "Y:%d,%d\n",
+                              (int)(g_mpu6050_yaw * 100.0f),
+                              g_mpu6050_alive);
+          if (ylen > 0 && ylen < (int)sizeof(y_line)) {
+              HAL_UART_Transmit(&huart1, (uint8_t*)y_line, ylen, 5);
+              if (huart5.gState == HAL_UART_STATE_READY) {
+                  HAL_UART_Transmit(&huart5, (uint8_t*)y_line, ylen, 5);
+              }
+          }
+      }
+
       if (osMutexWait(Mutex_SensorDataHandle, osWaitForever) == osOK) {
           g_sensor_data = sensor;
           osMutexRelease(Mutex_SensorDataHandle);
       }
 
-      osDelay(20); // 50Hz
+      osDelay(20);
   }
+
   /* USER CODE END StartTaskSensor */
 }
 
@@ -532,7 +707,11 @@ void StartTaskSensor(void const * argument)
 void StartTaskOLED(void const * argument)
 {
   /* USER CODE BEGIN StartTaskOLED */
-  OLED_Init();
+  /* I2C2 互斥保护 OLED 初始化 */
+  if (osMutexWait(Mutex_I2C2Handle, 50) == osOK) {
+      OLED_Init();
+      osMutexRelease(Mutex_I2C2Handle);
+  }
 
   /* ── 状态名 ↔ 中文字库索引映射 ──
      注：新增 STATE_SCANNING(扫描) 暂用 ASCII "SC" 显示，
@@ -625,7 +804,11 @@ void StartTaskOLED(void const * argument)
               OLED_ShowChar(120, 54, (heartbeat & 1) ? '*' : '.', 8, 1);
           }
 
-          OLED_Refresh();
+          /* I2C2 互斥：OLED 刷屏期间阻止 MPU6050 访问 */
+          if (osMutexWait(Mutex_I2C2Handle, 10) == osOK) {
+              OLED_Refresh();
+              osMutexRelease(Mutex_I2C2Handle);
+          }
 
           /* 心跳蜂鸣 5Hz */
           HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET);
@@ -644,7 +827,10 @@ void StartTaskOLED(void const * argument)
           /* 每 ~3 秒重试初始化 */
           if (++retry_tick >= 15) {
               retry_tick = 0;
-              OLED_Init();
+              if (osMutexWait(Mutex_I2C2Handle, 10) == osOK) {
+                  OLED_Init();
+                  osMutexRelease(Mutex_I2C2Handle);
+              }
           }
       }
 
@@ -712,6 +898,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
                 BaseType_t xHigherPriorityTaskWoken = pdFALSE;
                 xQueueSendFromISR(xQueue_VisionData, k210_dma_buf,
                                   &xHigherPriorityTaskWoken);
+                k210_frame_count++;  /* 调试计数器 */
                 portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
             }
         }
@@ -727,8 +914,8 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
   */
 static float CalcOneWheel(PID_TypeDef *pid, float speed_mps)
 {
-    // ── 堵转保护：PWM>300 且速度≈0 持续 500ms → 切断输出 ──
-    if (pid->out_PWM > 300.0f || pid->out_PWM < -300.0f) {
+    // ── 堵转保护：PWM>500 且速度≈0 持续 500ms → 切断输出 ──
+    if (pid->out_PWM > 500.0f || pid->out_PWM < -500.0f) {
         if (speed_mps < 0.01f && speed_mps > -0.01f) {
             pid->stall_cnt++;
         } else {

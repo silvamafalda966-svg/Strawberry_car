@@ -65,18 +65,14 @@ extern float              g_avg_speed_mps;   // 四轮平均速度 (m/s)，Task_
 extern int32_t            g_turn_enc;        // 四轮编码器绝对值累加（用于精算转角）
 extern uint32_t           g_sys_tick;        // 全局滴答（每 10ms +1），freertos.c 递增
 
-/* ────────── 避障子阶段枚举（不变） ────────── */
+/* ────────── 避障子阶段枚举（右绕 + 斜向回线） ────────── */
 typedef enum {
-    OB_STOP = 0,
-    OB_BACK,
-    OB_TURN_RIGHT,
-    OB_CROSS,
-    OB_TURN_LEFT1,
-    OB_FORWARD,
-    OB_TURN_LEFT2,
-    OB_RETURN,
-    OB_TURN_45,
-    OB_FORWARD_TO_LINE,
+    OB_STOP = 0,       // 刹车停顿 300ms
+    OB_BACK,           // 直线倒车 5cm
+    OB_TURN_RIGHT,     // 原地右转 90°
+    OB_FWD_RIGHT,      // 前进 25cm 绕过障碍
+    OB_TURN_LEFT135,   // 原地左转 135° 斜向对线
+    OB_SEEK,           // 直线前进，IR 找黑线
     OB_DONE
 } ObsSubStage_t;
 
@@ -92,6 +88,7 @@ typedef enum {
 // [2] 原地90°转弯 — 赛道地面原地右转 90°，car-studio 录 g_turn_enc
 //     当前为地板实测值，赛道上必须重测！
 #define TURN90_TOTAL_ENC    199700 // 赛道实测: 209700×90/94.5
+#define TURN96_TOTAL_ENC    213000 // 赛道实测: TURN90 × 96/90 ≈ 213000
 #define TURN45_TOTAL_ENC    (TURN90_TOTAL_ENC / 2)
 
 // [3] 原地180°掉头 — 赛道地面原地右转 180°，car-studio 录 g_turn_enc
@@ -105,17 +102,17 @@ typedef enum {
 /* ═══════════════════════════════════════════════════════════════ */
 
 /* ────────── Phase 2 可调参数（巡线 + 避障） ────────── */
-#define LINE_KP             0.04f
+#define LINE_KP             0.06f
 #define LINE_BASE_SPEED     0.3f
 #define OB_BACK_SPEED       0.2f
 #define OB_FWD_SPEED        0.3f
-#define OB_TURN_SPEED       0.15f
+#define OB_SEEK_SPEED       0.15f   // 斜向找线慢速，防冲过头
+#define OB_TURN_SPEED       0.25f   // 原 0.15，提升到 0.25 克服 FR 倒车死区
 #define OB_TURN_MS          2000
-#define OB_BACK_CM          5.0f   // 10→5, 倒车距离缩短
-#define OB_CROSS_CM         25.0f
-#define OB_FORWARD_CM       47.0f  // 绕过障碍物的前进距离
-#define OB_FWD_TO_LINE_CM   50.0f
-#define OB_BRAKE_TIMEOUT    50     // 100→50, 各阶段停顿减半
+#define OB_BACK_CM          5.0f    // 倒车距离 (cm)
+#define OB_FWD_RIGHT_CM     25.0f   // 右绕前进距离 (cm)
+#define OB_SEEK_MAX_CM      80.0f   // 找线最大距离 (cm)，超时兜底
+#define OB_BRAKE_TIMEOUT    50      // 阶段间刹车停顿 (tick)
 #define ENABLE_ULTRASONIC   1
 #define FORCE_STRAIGHT      0
 
@@ -123,7 +120,7 @@ typedef enum {
 // 岔路口检测
 #define JUNCTION_CONFIRM_FRAMES  3      // 连续 N 帧 6 路全黑 = 岔路确认
 #define JUNCTION_SIDE           -1      // 🔧 草莓区内侧：左转进入分支 (-1=左转, 1=右转)
-#define JUNCTION_SUPPRESS_MS     3000   // 出岔路后抑制重触发 (ms)
+#define JUNCTION_SUPPRESS_MS     2000   // 出岔路后抑制重触发 (ms)
 #define BRANCH_FWD_BEFORE_TURN_CM 13.0f  // 检测到岔路后前进距离：传感器→几何中心 (cm)
 
 // 分支线巡线
@@ -131,12 +128,12 @@ typedef enum {
 #define BRANCH_LINE_KP           0.04f  // 分支线 P 控制器增益
 
 // 超声波停车
-#define BRANCH_STOP_DIST_CM      36.0f  // 超声波 < 此值停车 (cm)
+#define BRANCH_STOP_DIST_CM      23.0f  // 超声波 < 此值停车 (cm)
 #define BRANCH_STOP_CONFIRM      5      // 连续 N 帧满足距离才停车
 
 // 判定
 #define BRANCH_JUDGE_TICKS       300    // 停车后采集 N 帧 K210 数据（3s）
-#define BRANCH_AREA_MIN          5      // 面积 < 此值视为噪声/误检
+#define BRANCH_AREA_MIN          2      // 面积 < 此值视为噪声/误检（v2新模型框较小）
 
 // 倒车返回
 #define BRANCH_REVERSE_SPEED     0.25f  // 倒车速度 (m/s)
@@ -155,10 +152,16 @@ typedef struct {
     uint8_t  total_red;     // 视野中红草莓总数
     uint8_t  total_green;   // 视野中绿草莓总数
     uint8_t  pick;          // 1=采摘, 0=跳过(绿/太小)
+    uint16_t frames_in;     // 调试：窗口内收到的帧总数
+    uint16_t frames_ok;     // 调试：其中 count>0 的帧数
+    uint8_t  best_red;      // 调试：最佳红面积
+    uint8_t  best_green;    // 调试：最佳绿面积
 } BranchDecision_t;
 
 extern BranchDecision_t g_branch_decision;
 extern uint8_t          g_branch_zone;     // 当前区域编号（每进岔路+1）
+extern float            g_mpu6050_yaw;     // MPU6050 陀螺仪积分航向角 (deg)
+extern uint8_t          g_mpu6050_alive;   // 1=陀螺仪 I2C 通信正常
 
 /* ── Zone Demo 任务状态 ── */
 extern uint8_t  g_zone_active;       // 1=Zone Demo 模式中

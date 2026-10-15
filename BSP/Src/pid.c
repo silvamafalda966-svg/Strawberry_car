@@ -19,9 +19,9 @@ void PID_Init(void)
     pid_FL.err_prev2 = 0.0f;
     pid_FL.direction = 1;       // 左前: 正向
     pid_FL.stall_cnt = 0;
-    pid_FL.Kp = 0.35f;          // Day 1 调优: Kp=0.35
-    pid_FL.Ki = 0.06f;          // Ki=0.06
-    pid_FL.Kd = 0.04f;          // Kd=0.04
+    pid_FL.Kp = 0.25f;          // V2 自动调参: Kp=0.25
+    pid_FL.Ki = 0.05f;          // Ki=0.05
+    pid_FL.Kd = 0.06f;          // Kd=0.06
     pid_FL.out_PWM = 0.0f;
     pid_FL.max_out_PWM = 999.0f;   // 必须小于或等于你的 TIM1 ARR (如 999)
     pid_FL.min_out_PWM = -999.0f;  // 必须支持负数进行反接制动和后退
@@ -34,9 +34,9 @@ void PID_Init(void)
     pid_BL.err_prev2 = 0.0f;
     pid_BL.direction = 1;       // 左后: 正向
     pid_BL.stall_cnt = 0;
-    pid_BL.Kp = 0.35f;
-    pid_BL.Ki = 0.06f;
-    pid_BL.Kd = 0.04f;
+    pid_BL.Kp = 0.25f;
+    pid_BL.Ki = 0.05f;
+    pid_BL.Kd = 0.06f;
     pid_BL.out_PWM = 0.0f;
     pid_BL.max_out_PWM = 999.0f;   
     pid_BL.min_out_PWM = -999.0f;  
@@ -50,9 +50,9 @@ void PID_Init(void)
     pid_FR.err_prev2 = 0.0f;
     pid_FR.direction = 1;       // 右前: 正向
     pid_FR.stall_cnt = 0;
-    pid_FR.Kp = 0.35f;
-    pid_FR.Ki = 0.06f;
-    pid_FR.Kd = 0.04f;
+    pid_FR.Kp = 0.25f;
+    pid_FR.Ki = 0.05f;
+    pid_FR.Kd = 0.06f;
     pid_FR.out_PWM = 0.0f;
     pid_FR.max_out_PWM = 999.0f;   
     pid_FR.min_out_PWM = -999.0f;  
@@ -65,9 +65,9 @@ void PID_Init(void)
     pid_BR.err_prev2 = 0.0f;
     pid_BR.direction = 1;       // 右后: 正向
     pid_BR.stall_cnt = 0;
-    pid_BR.Kp = 0.55f;
-    pid_BR.Ki = 0.05f;
-    pid_BR.Kd = 0.05f;
+    pid_BR.Kp = 0.25f;          // V2 四轮统一: Kp=0.25 (自动调参)
+    pid_BR.Ki = 0.05f;          // Ki=0.05
+    pid_BR.Kd = 0.06f;          // Kd=0.06
     pid_BR.out_PWM = 0.0f;
     pid_BR.max_out_PWM = 999.0f;   
     pid_BR.min_out_PWM = -999.0f;  

@@ -623,6 +623,11 @@
               <FileType>1</FileType>
               <FilePath>..\BSP\Src\oled.c</FilePath>
             </File>
+            <File>
+              <FileName>mpu6050.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\BSP\Src\mpu6050.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
