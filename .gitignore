@@ -1,15 +1,56 @@
-docs/node_modules/
-__pycache__/
-*.pyc
-.DS_Store
-MDK-ARM/Strawberry_car/*.axf
-MDK-ARM/Strawberry_car/*.hex
-MDK-ARM/Strawberry_car/*.htm
-MDK-ARM/Strawberry_car/*.map
-MDK-ARM/Strawberry_car/*.dep
-MDK-ARM/Strawberry_car/*.crf
-MDK-ARM/Strawberry_car/*.d
-MDK-ARM/Strawberry_car/*.o
+# ════════════════════════════════════════════════════
+#  Keil MDK-ARM 构建产物（只保留 .uvprojx / .sct / startup.s）
+# ════════════════════════════════════════════════════
+MDK-ARM/Strawberry_car/*
+!MDK-ARM/Strawberry_car/Strawberry_car.sct
+
+# 构建输出（散落在 MDK-ARM 根目录的情况）
+*.axf
+*.hex
+*.map
+*.htm
+*.build_log.htm
+*.lnp
+*.lst
+*.dep
+*.crf
+*.o
+*.d
+*.iex
+*.scvd
+*.bak
+*.uvguix.*
+*.uvoptx
+build.log
+keil-assistant.log
+uv4.log
+uv4.log.lock
+
+# Keil 自动生成目录
 MDK-ARM/RTE/
 MDK-ARM/DebugConfig/
+
+# ════════════════════════════════════════════════════
+#  编辑器 / 系统
+# ════════════════════════════════════════════════════
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ════════════════════════════════════════════════════
+#  Python
+# ════════════════════════════════════════════════════
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ════════════════════════════════════════════════════
+#  内部文档（答辩准备 / 交付交接 / 视频脚本，不公开）
+# ════════════════════════════════════════════════════
+docs/
+
+# 内部脚本
 BSP/Src/build_exam_answers.py
